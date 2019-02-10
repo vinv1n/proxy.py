@@ -69,12 +69,14 @@ def bytes_(s, encoding='utf-8', errors='strict'):   # pragma: no cover
     return s
 
 
-version = bytes_(__version__)
-CRLF, COLON, SP = b'\r\n', b':', b' '
-PROXY_AGENT_HEADER = b'Proxy-agent: proxy.py v' + version
 DEFAULT_SERVER_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_CLIENT_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_PROXY_CLIENT_TIMEOUT = 30   # seconds
+DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - pid:%(process)d - %(funcName)s:%(lineno)d - %(message)s'
+
+version = bytes_(__version__)
+CRLF, COLON, SP = b'\r\n', b':', b' '
+PROXY_AGENT_HEADER = b'Proxy-agent: proxy.py v' + version
 
 PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT = CRLF.join([
     b'HTTP/1.1 200 Connection established',
@@ -672,8 +674,6 @@ class HTTP(TCP):
         self.server_recvbuf_size = server_recvbuf_size
 
         self.num_workers = num_workers
-        if self.num_workers == 0:
-            self.num_workers = multiprocessing.cpu_count()
         self.client_queue = multiprocessing.Queue()
         self.workers = []
 
@@ -765,52 +765,62 @@ def main():
         epilog='Having difficulty using proxy.py? Report at: %s/issues/new' % __homepage__
     )
 
-    parser.add_argument('--hostname', default='127.0.0.1', help='Default: 127.0.0.1')
-    parser.add_argument('--port', default='8899', help='Default: 8899')
-    parser.add_argument('--backlog', default='100', help='Default: 100. '
-                                                         'Maximum number of pending connections to proxy server')
-    parser.add_argument('--num-workers', default='0', help='Default: Number of CPU cores.')
-    parser.add_argument('--basic-auth', default=None, help='Default: No authentication. '
-                                                           'Specify colon separated user:password '
-                                                           'to enable basic authentication.')
-    parser.add_argument('--server-recvbuf-size', default='0', help='Default: 1 MB. '
-                                                                   'Maximum amount of data received from the '
-                                                                   'server in a single recv() operation. Bump this '
-                                                                   'value for faster downloads at the expense of '
-                                                                   'increased RAM.')
-    parser.add_argument('--client-recvbuf-size', default='0', help='Default: 1 MB. '
-                                                                   'Maximum amount of data received from the '
-                                                                   'client in a single recv() operation. Bump this '
-                                                                   'value for faster uploads at the expense of '
-                                                                   'increased RAM.')
-    parser.add_argument('--open-file-limit', default='1024', help='Default: 1024. '
-                                                                  'Maximum number of files (TCP connections) '
-                                                                  'that proxy.py can open concurrently.')
-    parser.add_argument('--log-level', default='INFO', help='DEBUG, INFO (default), WARNING, ERROR, CRITICAL')
+    parser.add_argument('--hostname', type=str, default='127.0.0.1', help='Default: 127.0.0.1')
+    parser.add_argument('--port', type=int, default=8899, help='Default: 8899')
+    parser.add_argument('--backlog', type=int, default=100,
+                        help='Default: 100. '
+                             'Maximum number of pending connections '
+                             'to proxy server.')
+    parser.add_argument('--num-workers', type=int, default=0, help='Default: Number of CPU cores.')
+    parser.add_argument('--basic-auth', type=str, default=None,
+                        help='Default: No authentication. '
+                             'Specify colon separated user:password '
+                             'to enable basic authentication.')
+    parser.add_argument('--server-recvbuf-size', type=int, default=0,
+                        help='Default: 1 MB. '
+                             'Maximum amount of data received from the '
+                             'server in a single recv() operation. Bump this '
+                             'value for faster downloads at the expense of '
+                             'increased RAM.')
+    parser.add_argument('--client-recvbuf-size', type=int, default=0,
+                        help='Default: 1 MB. '
+                             'Maximum amount of data received from the '
+                             'client in a single recv() operation. Bump this '
+                             'value for faster uploads at the expense of '
+                             'increased RAM.')
+    parser.add_argument('--open-file-limit', type=int, default=1024,
+                        help='Default: 1024. '
+                             'Maximum number of files (TCP connections) '
+                             'that proxy.py can open concurrently.')
+    parser.add_argument('--log-level', type=str, default='INFO',
+                        help='DEBUG, INFO (default), WARNING, ERROR, CRITICAL.')
+    parser.add_argument('--version', default=version, help='Print proxy.py version.')
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level),
-                        format='%(asctime)s - %(levelname)s - pid:%(process)d - %(funcName)s:%(lineno)d - %(message)s')
-
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format=DEFAULT_LOGGING_FORMAT)
     try:
-        set_open_file_limit(int(args.open_file_limit))
+        set_open_file_limit(args.open_file_limit)
 
         auth_code = None
         if args.basic_auth:
             auth_code = b'Basic %s' % base64.b64encode(bytes_(args.basic_auth))
 
         server_recvbuf_size = DEFAULT_SERVER_RECVBUF_SIZE
-        if int(args.server_recvbuf_size) > 0:
-            server_recvbuf_size = int(args.server_recvbuf_size)
+        if args.server_recvbuf_size > 0:
+            server_recvbuf_size = args.server_recvbuf_size
 
         client_recvbuf_size = DEFAULT_CLIENT_RECVBUF_SIZE
-        if int(args.client_recvbuf_size) > 0:
-            client_recvbuf_size = int(args.client_recvbuf_size)
+        if args.client_recvbuf_size > 0:
+            client_recvbuf_size = args.client_recvbuf_size
+
+        num_workers = multiprocessing.cpu_count()
+        if args.num_workers > 0:
+            num_workers = args.num_workers
 
         proxy = HTTP(hostname=args.hostname,
-                     port=int(args.port),
-                     backlog=int(args.backlog),
-                     num_workers=int(args.num_workers),
+                     port=args.port,
+                     backlog=args.backlog,
+                     num_workers=num_workers,
                      auth_code=auth_code,
                      server_recvbuf_size=server_recvbuf_size,
                      client_recvbuf_size=client_recvbuf_size)
