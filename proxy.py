@@ -686,7 +686,12 @@ class HTTP(TCP):
             self.workers.append(worker)
 
     def handle(self, client):
-        self.client_queue.put((Worker.operations.PROXY, {'client': client}))
+        self.client_queue.put((Worker.operations.PROXY, {
+            'client': client,
+            'auth_code': self.auth_code,
+            'server_recvbuf_size': self.server_recvbuf_size,
+            'client_recvbuf_size': self.client_recvbuf_size,
+        }))
 
     def shutdown(self):
         logger.info('Shutting down workers')
@@ -734,8 +739,12 @@ class Worker(multiprocessing.Process):
                 if operation == Worker.operations.SHUTDOWN:
                     break
                 elif operation == Worker.operations.PROXY:
-                    Worker.proxy(payload['client'])
+                    Worker.proxy(payload['client'], payload['auth_code'],
+                                 payload['server_recvbuf_size'], payload['client_recvbuf_size'])
             except queue.Empty:
+                pass
+            # Safeguard against https://gist.github.com/abhinavsingh/b8d4266ff4f38b6057f9c50075e8cd75
+            except ConnectionRefusedError:
                 pass
             except KeyboardInterrupt:
                 break

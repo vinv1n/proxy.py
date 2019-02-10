@@ -13,7 +13,9 @@ __pycache__
 venv
 cover
 dist
+build
 proxy.py.egg-info
+proxy.py.iml
 
 LICENSE
 MANIFEST.in
