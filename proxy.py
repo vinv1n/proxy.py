@@ -264,7 +264,10 @@ class HttpParser(object):
         line = data.split(SP)
         if self.type == HttpParser.types.REQUEST_PARSER:
             self.method = line[0].upper()
-            self.url = urlparse.urlsplit(line[1])
+            if self.method == b'CONNECT':
+                self.url = urlparse.SplitResult(b'', line[1], b'', b'', b'')
+            else:
+                self.url = urlparse.urlsplit(line[1])
             self.version = line[2]
         else:
             self.version = line[0]
@@ -480,7 +483,7 @@ class Proxy(threading.Thread):
                     raise ProxyAuthenticationFailed()
 
             if self.request.method == b'CONNECT':
-                host, port = self.request.url.path.split(COLON)
+                host, port = self.request.url.netloc.split(COLON)
             elif self.request.url:
                 host, port = self.request.url.hostname, self.request.url.port if self.request.url.port else 80
             else:

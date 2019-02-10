@@ -268,6 +268,21 @@ class TestHttpParser(unittest.TestCase):
         self.assertEqual(self.parser.method, b'POST')
         self.assertEqual(self.parser.state, HttpParser.states.COMPLETE)
 
+    def test_cannot_parse_malformed_request_line(self):
+        self.parser.parse(CRLF.join([
+            b'GET       http://localhost        HTTP/1.1',
+            b'Host: localhost',
+            CRLF
+        ]))
+        self.assertEqual(self.parser.method, b'GET')
+        self.assertNotEqual(self.parser.url.scheme, b'http')
+        self.assertNotEqual(self.parser.url.netloc, b'localhost')
+        self.assertEqual(self.parser.url.path, b'')
+        self.assertEqual(self.parser.url.query, b'')
+        self.assertEqual(self.parser.url.fragment, b'')
+        self.assertNotEqual(self.parser.version, b'HTTP/1.1')
+        self.assertEqual(self.parser.state, HttpParser.states.COMPLETE)
+
     def test_response_parse_without_content_length(self):
         """Case when server response doesn't contain a content-length header for non-chunk response types.
 
