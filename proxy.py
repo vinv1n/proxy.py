@@ -12,6 +12,7 @@
 import os
 import sys
 import errno
+import queue
 import base64
 import socket
 import select
@@ -19,6 +20,7 @@ import logging
 import argparse
 import datetime
 import threading
+import multiprocessing
 from collections import namedtuple
 
 if os.name != 'nt':
@@ -70,6 +72,9 @@ def bytes_(s, encoding='utf-8', errors='strict'):   # pragma: no cover
 version = bytes_(__version__)
 CRLF, COLON, SP = b'\r\n', b':', b' '
 PROXY_AGENT_HEADER = b'Proxy-agent: proxy.py v' + version
+DEFAULT_SERVER_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
+DEFAULT_CLIENT_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
+DEFAULT_PROXY_CLIENT_TIMEOUT = 30   # seconds
 
 PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT = CRLF.join([
     b'HTTP/1.1 200 Connection established',
@@ -339,7 +344,7 @@ class Connection(object):
         # TODO: Gracefully handle BrokenPipeError exceptions
         return self.conn.send(data)
 
-    def recv(self, bufsiz=8192):
+    def recv(self, bufsiz):
         try:
             data = self.conn.recv(bufsiz)
             if len(data) == 0:
@@ -423,10 +428,12 @@ class Proxy(threading.Thread):
     Accepts `Client` connection object and act as a proxy between client and server.
     """
 
-    def __init__(self, client, auth_code=None, server_recvbuf_size=8192, client_recvbuf_size=8192):
+    def __init__(self, client, auth_code=None,
+                 server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
+                 client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
         super(Proxy, self).__init__()
 
-        self.start_time = self._now()
+        self.start_time = Proxy.now()
         self.last_activity = self.start_time
 
         self.auth_code = auth_code
@@ -439,16 +446,16 @@ class Proxy(threading.Thread):
         self.response = HttpParser(HttpParser.types.RESPONSE_PARSER)
 
     @staticmethod
-    def _now():
+    def now():
         return datetime.datetime.utcnow()
 
-    def _inactive_for(self):
-        return (self._now() - self.last_activity).seconds
+    def inactive_for(self):
+        return (Proxy.now() - self.last_activity).seconds
 
-    def _is_inactive(self):
-        return self._inactive_for() > 30
+    def is_inactive(self):
+        return self.inactive_for() > DEFAULT_PROXY_CLIENT_TIMEOUT
 
-    def _process_request(self, data):
+    def process_request(self, data):
         # once we have connection to the server
         # we don't parse the http request packets
         # any further, instead just pipe incoming
@@ -499,7 +506,7 @@ class Proxy(threading.Thread):
                     add_headers=[(b'Via', b'1.1 proxy.py v%s' % version), (b'Connection', b'Close')]
                 ))
 
-    def _process_response(self, data):
+    def process_response(self, data):
         # parse incoming response packet
         # only for non-https requests
         if not self.request.method == b'CONNECT':
@@ -508,7 +515,7 @@ class Proxy(threading.Thread):
         # queue data for client
         self.client.queue(data)
 
-    def _access_log(self):
+    def access_log(self):
         host, port = self.server.addr if self.server else (None, None)
         if self.request.method == b'CONNECT':
             logger.info(
@@ -518,7 +525,7 @@ class Proxy(threading.Thread):
                 self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.build_url(),
                 self.response.code, self.response.reason, len(self.response.raw)))
 
-    def _get_waitable_lists(self):
+    def get_waitable_lists(self):
         rlist, wlist, xlist = [self.client.conn], [], []
         if self.client.has_buffer():
             wlist.append(self.client.conn)
@@ -528,7 +535,7 @@ class Proxy(threading.Thread):
             wlist.append(self.server.conn)
         return rlist, wlist, xlist
 
-    def _process_wlist(self, w):
+    def process_wlist(self, w):
         if self.client.conn in w:
             logger.debug('client is ready for writes, flushing client buffer')
             self.client.flush()
@@ -537,45 +544,45 @@ class Proxy(threading.Thread):
             logger.debug('server is ready for writes, flushing server buffer')
             self.server.flush()
 
-    def _process_rlist(self, r):
+    def process_rlist(self, r):
         """Returns True if connection to client must be closed."""
         if self.client.conn in r:
             logger.debug('client is ready for reads, reading')
             data = self.client.recv(self.client_recvbuf_size)
-            self.last_activity = self._now()
+            self.last_activity = Proxy.now()
 
             if not data:
                 logger.debug('client closed connection, breaking')
                 return True
 
             try:
-                self._process_request(data)
+                self.process_request(data)
             except (ProxyAuthenticationFailed, ProxyConnectionFailed) as e:
                 logger.exception(e)
-                self.client.queue(Proxy._get_response_pkt_by_exception(e))
+                self.client.queue(Proxy.get_response_pkt_by_exception(e))
                 self.client.flush()
                 return True
 
         if self.server and not self.server.closed and self.server.conn in r:
             logger.debug('server is ready for reads, reading')
             data = self.server.recv(self.server_recvbuf_size)
-            self.last_activity = self._now()
+            self.last_activity = Proxy.now()
 
             if not data:
                 logger.debug('server closed connection')
                 self.server.close()
             else:
-                self._process_response(data)
+                self.process_response(data)
 
         return False
 
-    def _process(self):
+    def process(self):
         while True:
-            rlist, wlist, xlist = self._get_waitable_lists()
+            rlist, wlist, xlist = self.get_waitable_lists()
             r, w, x = select.select(rlist, wlist, xlist, 1)
 
-            self._process_wlist(w)
-            if self._process_rlist(r):
+            self.process_wlist(w)
+            if self.process_rlist(r):
                 break
 
             if self.client.buffer_size() == 0:
@@ -583,12 +590,12 @@ class Proxy(threading.Thread):
                     logger.debug('client buffer is empty and response state is complete, breaking')
                     break
 
-                if self._is_inactive():
+                if self.is_inactive():
                     logger.debug('client buffer is empty and maximum inactivity has reached, breaking')
                     break
 
     @staticmethod
-    def _get_response_pkt_by_exception(e):
+    def get_response_pkt_by_exception(e):
         if e.__class__.__name__ == 'ProxyAuthenticationFailed':
             return PROXY_AUTHENTICATION_REQUIRED_RESPONSE_PKT
         if e.__class__.__name__ == 'ProxyConnectionFailed':
@@ -597,7 +604,7 @@ class Proxy(threading.Thread):
     def run(self):
         logger.debug('Proxying connection %r' % self.client.conn)
         try:
-            self._process()
+            self.process()
         except KeyboardInterrupt:
             pass
         except Exception as e:
@@ -609,7 +616,7 @@ class Proxy(threading.Thread):
             if self.server:
                 logger.debug(
                     'closed client connection with pending server buffer size %d bytes' % self.server.buffer_size())
-            self._access_log()
+            self.access_log()
             logger.debug('Closing proxy for connection %r at address %r' % (self.client.conn, self.client.addr))
 
 
@@ -628,6 +635,9 @@ class TCP(object):
     def handle(self, client):
         raise NotImplementedError()
 
+    def shutdown(self):
+        pass
+
     def run(self):
         try:
             logger.info('Starting server on port %d' % self.port)
@@ -642,6 +652,7 @@ class TCP(object):
         except Exception as e:
             logger.exception('Exception while running the server %r' % e)
         finally:
+            self.shutdown()
             logger.info('Closing server socket')
             self.socket.close()
 
@@ -652,20 +663,82 @@ class HTTP(TCP):
     Spawns new process to proxy accepted client connection.
     """
 
-    def __init__(self, hostname='127.0.0.1', port=8899, backlog=100,
-                 auth_code=None, server_recvbuf_size=8192, client_recvbuf_size=8192):
+    def __init__(self, hostname='127.0.0.1', port=8899, backlog=100, num_workers=0,
+                 auth_code=None, server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
+                 client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
         super(HTTP, self).__init__(hostname, port, backlog)
         self.auth_code = auth_code
         self.client_recvbuf_size = client_recvbuf_size
         self.server_recvbuf_size = server_recvbuf_size
 
+        self.num_workers = num_workers
+        if self.num_workers == 0:
+            self.num_workers = multiprocessing.cpu_count()
+        self.client_queue = multiprocessing.Queue()
+        self.workers = []
+
+    def init_workers(self):
+        logger.info('Starting %d workers' % self.num_workers)
+        for worker_id in range(self.num_workers):
+            worker = Worker(self.client_queue)
+            worker.daemon = True
+            worker.start()
+            self.workers.append(worker)
+
     def handle(self, client):
-        proxy = Proxy(client,
-                      auth_code=self.auth_code,
-                      server_recvbuf_size=self.server_recvbuf_size,
-                      client_recvbuf_size=self.client_recvbuf_size)
-        proxy.daemon = True
-        proxy.start()
+        self.client_queue.put((Worker.operations.PROXY, {'client': client}))
+
+    def shutdown(self):
+        logger.info('Shutting down workers')
+        for worker_id in range(self.num_workers):
+            self.client_queue.put((Worker.operations.SHUTDOWN, {}))
+        for worker_id in range(self.num_workers):
+            self.workers[worker_id].join()
+
+
+class Worker(multiprocessing.Process):
+    """Proxy worker runs in a separate process
+    and spawns Proxy threads for received client request.
+
+    Accepted client requests are queued over `client_queue`
+    by the main thread. One of the worker picks up the client
+    request and spawns a separate thread per to proxy the request.
+
+    Workers allow proxy.py to take advantage of all the cores
+    available on the machine.
+    """
+
+    operations = namedtuple('WorkerOperations', (
+        'SHUTDOWN',
+        'PROXY'
+    ))(1, 2)
+
+    def __init__(self, client_queue):
+        super(Worker, self).__init__()
+        self.client_queue = client_queue
+
+    @staticmethod
+    def proxy(client, auth_code=None,
+              server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
+              client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
+        p = Proxy(client, auth_code=auth_code,
+                  server_recvbuf_size=server_recvbuf_size,
+                  client_recvbuf_size=client_recvbuf_size)
+        p.daemon = True
+        p.start()
+
+    def run(self):
+        while True:
+            try:
+                operation, payload = self.client_queue.get(True, 1)
+                if operation == Worker.operations.SHUTDOWN:
+                    break
+                elif operation == Worker.operations.PROXY:
+                    Worker.proxy(payload['client'])
+            except queue.Empty:
+                pass
+            except KeyboardInterrupt:
+                break
 
 
 def set_open_file_limit(soft_limit):
@@ -687,19 +760,20 @@ def main():
     parser.add_argument('--port', default='8899', help='Default: 8899')
     parser.add_argument('--backlog', default='100', help='Default: 100. '
                                                          'Maximum number of pending connections to proxy server')
+    parser.add_argument('--num-workers', default='0', help='Default: Number of CPU cores.')
     parser.add_argument('--basic-auth', default=None, help='Default: No authentication. '
                                                            'Specify colon separated user:password '
                                                            'to enable basic authentication.')
-    parser.add_argument('--server-recvbuf-size', default='8192', help='Default: 8 KB. '
-                                                                      'Maximum amount of data received from the '
-                                                                      'server in a single recv() operation. Bump this '
-                                                                      'value for faster downloads at the expense of '
-                                                                      'increased RAM.')
-    parser.add_argument('--client-recvbuf-size', default='8192', help='Default: 8 KB. '
-                                                                      'Maximum amount of data received from the '
-                                                                      'client in a single recv() operation. Bump this '
-                                                                      'value for faster uploads at the expense of '
-                                                                      'increased RAM.')
+    parser.add_argument('--server-recvbuf-size', default='0', help='Default: 1 MB. '
+                                                                   'Maximum amount of data received from the '
+                                                                   'server in a single recv() operation. Bump this '
+                                                                   'value for faster downloads at the expense of '
+                                                                   'increased RAM.')
+    parser.add_argument('--client-recvbuf-size', default='0', help='Default: 1 MB. '
+                                                                   'Maximum amount of data received from the '
+                                                                   'client in a single recv() operation. Bump this '
+                                                                   'value for faster uploads at the expense of '
+                                                                   'increased RAM.')
     parser.add_argument('--open-file-limit', default='1024', help='Default: 1024. '
                                                                   'Maximum number of files (TCP connections) '
                                                                   'that proxy.py can open concurrently.')
@@ -707,7 +781,7 @@ def main():
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level),
-                        format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
+                        format='%(asctime)s - %(levelname)s - pid:%(process)d - %(funcName)s:%(lineno)d - %(message)s')
 
     try:
         set_open_file_limit(int(args.open_file_limit))
@@ -716,12 +790,22 @@ def main():
         if args.basic_auth:
             auth_code = b'Basic %s' % base64.b64encode(bytes_(args.basic_auth))
 
+        server_recvbuf_size = DEFAULT_SERVER_RECVBUF_SIZE
+        if int(args.server_recvbuf_size) > 0:
+            server_recvbuf_size = int(args.server_recvbuf_size)
+
+        client_recvbuf_size = DEFAULT_CLIENT_RECVBUF_SIZE
+        if int(args.client_recvbuf_size) > 0:
+            client_recvbuf_size = int(args.client_recvbuf_size)
+
         proxy = HTTP(hostname=args.hostname,
                      port=int(args.port),
                      backlog=int(args.backlog),
+                     num_workers=int(args.num_workers),
                      auth_code=auth_code,
-                     server_recvbuf_size=int(args.server_recvbuf_size),
-                     client_recvbuf_size=int(args.client_recvbuf_size))
+                     server_recvbuf_size=server_recvbuf_size,
+                     client_recvbuf_size=client_recvbuf_size)
+        proxy.init_workers()
         proxy.run()
     except KeyboardInterrupt:
         pass

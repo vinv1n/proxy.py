@@ -17,7 +17,8 @@ from threading import Thread
 from contextlib import closing
 from proxy import Proxy, ChunkParser, HttpParser, Client
 from proxy import ProxyAuthenticationFailed, ProxyConnectionFailed
-from proxy import CRLF, version, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT
+from proxy import CRLF, version, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT, \
+    DEFAULT_SERVER_RECVBUF_SIZE, DEFAULT_CLIENT_RECVBUF_SIZE
 
 # logging.basicConfig(level=logging.DEBUG,
 #                     format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
@@ -428,7 +429,7 @@ class TestProxy(unittest.TestCase):
     def test_http_get(self):
         # Send request line
         self.proxy.client.conn.queue((b'GET http://localhost:%d HTTP/1.1' % self.http_server_port) + CRLF)
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertNotEqual(self.proxy.request.state, HttpParser.states.COMPLETE)
         # Send headers and blank line, thus completing HTTP request
         self.proxy.client.conn.queue(CRLF.join([
@@ -438,20 +439,20 @@ class TestProxy(unittest.TestCase):
             b'Proxy-Connection: Keep-Alive',
             CRLF
         ]))
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertEqual(self.proxy.request.state, HttpParser.states.COMPLETE)
         self.assertEqual(self.proxy.server.addr, (b'localhost', self.http_server_port))
         # Flush data queued for server
         self.proxy.server.flush()
         self.assertEqual(self.proxy.server.buffer_size(), 0)
         # Receive full response from server
-        data = self.proxy.server.recv()
+        data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
         while data:
-            self.proxy._process_response(data)
+            self.proxy.process_response(data)
             logging.info(self.proxy.response.state)
             if self.proxy.response.state == HttpParser.states.COMPLETE:
                 break
-            data = self.proxy.server.recv()
+            data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
         # Verify 200 success response code
         self.assertEqual(self.proxy.response.state, HttpParser.states.COMPLETE)
         self.assertEqual(int(self.proxy.response.code), 200)
@@ -464,7 +465,7 @@ class TestProxy(unittest.TestCase):
             b'Proxy-Connection: Keep-Alive',
             CRLF
         ]))
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertFalse(self.proxy.server is None)
         self.assertEqual(self.proxy.client.buffer, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT)
 
@@ -482,24 +483,24 @@ class TestProxy(unittest.TestCase):
             b'User-Agent: proxy.py/%s' % version,
             CRLF
         ]))
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.proxy.server.flush()
         self.assertEqual(self.proxy.server.buffer_size(), 0)
 
         parser = HttpParser(HttpParser.types.RESPONSE_PARSER)
-        data = self.proxy.server.recv()
+        data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
         while data:
             parser.parse(data)
             if parser.state == HttpParser.states.COMPLETE:
                 break
-            data = self.proxy.server.recv()
+            data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
 
         self.assertEqual(parser.state, HttpParser.states.COMPLETE)
         self.assertEqual(int(parser.code), 200)
 
     def test_proxy_connection_failed(self):
         with self.assertRaises(ProxyConnectionFailed):
-            self.proxy._process_request(CRLF.join([
+            self.proxy.process_request(CRLF.join([
                 b'GET http://unknown.domain HTTP/1.1',
                 b'Host: unknown.domain',
                 CRLF
@@ -509,7 +510,7 @@ class TestProxy(unittest.TestCase):
         self.proxy = Proxy(Client(self._conn, self._addr), b'Basic %s' % base64.b64encode(b'user:pass'))
 
         with self.assertRaises(ProxyAuthenticationFailed):
-            self.proxy._process_request(CRLF.join([
+            self.proxy.process_request(CRLF.join([
                 b'GET http://abhinavsingh.com HTTP/1.1',
                 b'Host: abhinavsingh.com',
                 CRLF
@@ -519,7 +520,7 @@ class TestProxy(unittest.TestCase):
         self.proxy = Proxy(Client(self._conn, self._addr), b'Basic %s' % base64.b64encode(b'user:pass'))
 
         self.proxy.client.conn.queue((b'GET http://localhost:%d HTTP/1.1' % self.http_server_port) + CRLF)
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertNotEqual(self.proxy.request.state, HttpParser.states.COMPLETE)
 
         self.proxy.client.conn.queue(CRLF.join([
@@ -531,19 +532,19 @@ class TestProxy(unittest.TestCase):
             CRLF
         ]))
 
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertEqual(self.proxy.request.state, HttpParser.states.COMPLETE)
         self.assertEqual(self.proxy.server.addr, (b'localhost', self.http_server_port))
 
         self.proxy.server.flush()
         self.assertEqual(self.proxy.server.buffer_size(), 0)
 
-        data = self.proxy.server.recv()
+        data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
         while data:
-            self.proxy._process_response(data)
+            self.proxy.process_response(data)
             if self.proxy.response.state == HttpParser.states.COMPLETE:
                 break
-            data = self.proxy.server.recv()
+            data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
 
         self.assertEqual(self.proxy.response.state, HttpParser.states.COMPLETE)
         self.assertEqual(int(self.proxy.response.code), 200)
@@ -559,7 +560,7 @@ class TestProxy(unittest.TestCase):
             b'Proxy-Authorization: Basic dXNlcjpwYXNz',
             CRLF
         ]))
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertFalse(self.proxy.server is None)
         self.assertEqual(self.proxy.client.buffer, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT)
 
@@ -577,17 +578,17 @@ class TestProxy(unittest.TestCase):
             b'User-Agent: proxy.py/%s' % version,
             CRLF
         ]))
-        self.proxy._process_request(self.proxy.client.recv())
+        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.proxy.server.flush()
         self.assertEqual(self.proxy.server.buffer_size(), 0)
 
         parser = HttpParser(HttpParser.types.RESPONSE_PARSER)
-        data = self.proxy.server.recv()
+        data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
         while data:
             parser.parse(data)
             if parser.state == HttpParser.states.COMPLETE:
                 break
-            data = self.proxy.server.recv()
+            data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
 
         self.assertEqual(parser.state, HttpParser.states.COMPLETE)
         self.assertEqual(int(parser.code), 200)
