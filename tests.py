@@ -13,9 +13,10 @@ import base64
 import socket
 import logging
 import unittest
+import urllib.request
 from threading import Thread
 from contextlib import closing
-from proxy import Proxy, ChunkParser, HttpParser, Client
+from proxy import HTTP, Proxy, ChunkParser, HttpParser, Client
 from proxy import ProxyAuthenticationFailed, ProxyConnectionFailed
 from proxy import CRLF, version, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT, \
     DEFAULT_SERVER_RECVBUF_SIZE, DEFAULT_CLIENT_RECVBUF_SIZE
@@ -399,14 +400,35 @@ class MockConnection(object):
         self.buffer += data
 
 
+def get_available_port():
+    """Finds and retuns an available port on the system."""
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind(('', 0))
+        _, port = sock.getsockname()
+        return port
+
+
 class HTTPRequestHandler(BaseHTTPRequestHandler):
+    """Http request handler which returns a static hardcoded response for all requested GET URLs."""
 
     def do_GET(self):
+        logging.info('request received')
         self.send_response(200)
         # TODO(abhinavsingh): Proxy should work just fine even without content-length header
         self.send_header('content-length', 2)
         self.end_headers()
         self.wfile.write(b'OK')
+
+
+def start_http_server(http_handler=HTTPRequestHandler):
+    """Starts a HTTP server on a random port in a separate thread."""
+    http_server_port = get_available_port()
+    logging.info('Starting http server for test on port %d' % http_server_port)
+    http_server = HTTPServer(('127.0.0.1', http_server_port), http_handler)
+    http_server_thread = Thread(target=http_server.serve_forever)
+    http_server_thread.setDaemon(True)
+    http_server_thread.start()
+    return http_server_port, http_server, http_server_thread
 
 
 class TestProxy(unittest.TestCase):
@@ -415,20 +437,9 @@ class TestProxy(unittest.TestCase):
     http_server_port = None
     http_server_thread = None
 
-    @staticmethod
-    def get_available_port():
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            sock.bind(('', 0))
-            _, port = sock.getsockname()
-            return port
-
     @classmethod
     def setUpClass(cls):
-        cls.http_server_port = cls.get_available_port()
-        cls.http_server = HTTPServer(('127.0.0.1', cls.http_server_port), HTTPRequestHandler)
-        cls.http_server_thread = Thread(target=cls.http_server.serve_forever)
-        cls.http_server_thread.setDaemon(True)
-        cls.http_server_thread.start()
+        cls.http_server_port, cls.http_server, cls.http_server_thread = start_http_server()
 
     @classmethod
     def tearDownClass(cls):
@@ -607,6 +618,63 @@ class TestProxy(unittest.TestCase):
 
         self.assertEqual(parser.state, HttpParser.states.COMPLETE)
         self.assertEqual(int(parser.code), 200)
+
+
+def start_proxy_server():
+    """Starts proxy.py server on a random port in a separate thread."""
+    proxy_server_port = get_available_port()
+    proxy_server = HTTP(port=proxy_server_port)
+    proxy_server_thread = Thread(target=proxy_server.run)
+    proxy_server_thread.setDaemon(True)
+    proxy_server_thread.start()
+    return proxy_server_port, proxy_server, proxy_server_thread
+
+
+class TestWorkers(unittest.TestCase):
+
+    http_server = None
+    http_server_port = None
+    http_server_thread = None
+
+    proxy_server = None
+    proxy_server_port = None
+    proxy_server_thread = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.http_server_port, cls.http_server, cls.http_server_thread = start_http_server()
+        cls.proxy_server_port, cls.proxy_server, cls.proxy_server_thread = start_proxy_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.http_server.shutdown()
+        cls.http_server.server_close()
+        cls.http_server_thread.join()
+        cls.proxy_server.stop()
+        cls.proxy_server_thread.join()
+
+    @staticmethod
+    def make_request(http_server_port, proxy_server_port):
+        proxy_address = 'http://127.0.0.1:%d' % proxy_server_port
+        logging.info('Using proxy %s' % proxy_address)
+        proxy = urllib.request.ProxyHandler({'http': proxy_address})
+        opener = urllib.request.build_opener(proxy)
+        urllib.request.install_opener(opener)
+        request_url = 'http://127.0.0.1:%d' % http_server_port
+        logging.info('Making request to %s' % request_url)
+
+        while True:
+            try:
+                response = urllib.request.urlopen(request_url, timeout=1)
+                data = response.read()
+                response.close()
+                return data
+            except urllib.error.URLError:
+                logging.info('Connection refused, trying again')
+
+    def test_all_requests_are_proxied(self):
+        for req_id in range(5):
+            self.assertTrue(TestWorkers.make_request(self.http_server_port, self.proxy_server_port), b'OK')
 
 
 if __name__ == '__main__':

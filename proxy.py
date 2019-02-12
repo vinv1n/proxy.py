@@ -540,7 +540,7 @@ class Proxy(threading.Thread):
             wlist.append(self.server.conn)
         return rlist, wlist, xlist
 
-    def process_wlist(self, w):
+    def process_writable(self, w):
         if self.client.conn in w:
             logger.debug('client is ready for writes, flushing client buffer')
             self.client.flush()
@@ -549,7 +549,7 @@ class Proxy(threading.Thread):
             logger.debug('server is ready for writes, flushing server buffer')
             self.server.flush()
 
-    def process_rlist(self, r):
+    def process_readable(self, r):
         """Returns True if connection to client must be closed."""
         if self.client.conn in r:
             logger.debug('client is ready for reads, reading')
@@ -584,10 +584,10 @@ class Proxy(threading.Thread):
     def process(self):
         while True:
             rlist, wlist, xlist = self.get_waitable_lists()
-            r, w, x = select.select(rlist, wlist, xlist, 1)
+            readable, writable, errored = select.select(rlist, wlist, xlist, 1)
 
-            self.process_wlist(w)
-            if self.process_rlist(r):
+            self.process_writable(writable)
+            if self.process_readable(readable):
                 break
 
             if self.client.buffer_size() == 0:
@@ -632,6 +632,7 @@ class TCP(object):
     """
 
     def __init__(self, hostname='127.0.0.1', port=8899, backlog=100):
+        self.running = True
         self.hostname = hostname
         self.port = port
         self.backlog = backlog
@@ -645,15 +646,18 @@ class TCP(object):
 
     def run(self):
         try:
-            logger.info('Starting server on port %d' % self.port)
+            logger.info('Starting proxy.py on port %d' % self.port)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self.socket.bind((self.hostname, self.port))
             self.socket.listen(self.backlog)
-            while True:
-                conn, addr = self.socket.accept()
-                client = Client(conn, addr)
-                self.handle(client)
+
+            while self.running:
+                readable, _, _ = select.select([self.socket], [], [], 1)
+                if self.socket in readable:
+                    conn, addr = self.socket.accept()
+                    client = Client(conn, addr)
+                    self.handle(client)
         except Exception as e:
             logger.exception('Exception while running the server %r' % e)
         finally:
@@ -661,11 +665,15 @@ class TCP(object):
             logger.info('Closing server socket')
             self.socket.close()
 
+    def stop(self):
+        self.running = False
+
 
 class HTTP(TCP):
     """HTTP proxy server implementation.
 
-    Spawns new process to proxy accepted client connection.
+    Dispatches accepted client connections over the `client_queue`. Requests
+    are consumed from the queue and proxied by the worker processes.
     """
 
     def __init__(self, hostname='127.0.0.1', port=8899, backlog=100, num_workers=0,
@@ -676,8 +684,11 @@ class HTTP(TCP):
         self.client_recvbuf_size = client_recvbuf_size
         self.server_recvbuf_size = server_recvbuf_size
 
-        self.num_workers = num_workers
         self.client_queue = multiprocessing.Queue()
+
+        self.num_workers = multiprocessing.cpu_count()
+        if num_workers > 0:
+            self.num_workers = num_workers
         self.workers = []
 
     def init_workers(self):
@@ -702,6 +713,10 @@ class HTTP(TCP):
             self.client_queue.put((Worker.operations.SHUTDOWN, {}))
         for worker_id in range(self.num_workers):
             self.workers[worker_id].join()
+
+    def run(self):
+        self.init_workers()
+        super(HTTP, self).run()
 
 
 class Worker(multiprocessing.Process):
@@ -816,18 +831,13 @@ def main():
         if args.client_recvbuf_size > 0:
             client_recvbuf_size = args.client_recvbuf_size
 
-        num_workers = multiprocessing.cpu_count()
-        if args.num_workers > 0:
-            num_workers = args.num_workers
-
         proxy = HTTP(hostname=args.hostname,
                      port=args.port,
                      backlog=args.backlog,
-                     num_workers=num_workers,
+                     num_workers=args.num_workers,
                      auth_code=auth_code,
                      server_recvbuf_size=server_recvbuf_size,
                      client_recvbuf_size=client_recvbuf_size)
-        proxy.init_workers()
         proxy.run()
     except KeyboardInterrupt:
         pass
