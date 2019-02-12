@@ -399,6 +399,9 @@ class MockConnection(object):
     def queue(self, data):
         self.buffer += data
 
+    def close(self):
+        pass
+
 
 def get_available_port():
     """Finds and retuns an available port on the system."""
@@ -665,10 +668,8 @@ class TestWorkers(unittest.TestCase):
 
         while True:
             try:
-                response = urllib.request.urlopen(request_url, timeout=1)
-                data = response.read()
-                response.close()
-                return data
+                with closing(urllib.request.urlopen(request_url, timeout=1)) as response:
+                    return response.read()
             except urllib.error.URLError:
                 logging.info('Connection refused, trying again')
 

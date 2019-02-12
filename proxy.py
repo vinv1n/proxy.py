@@ -407,6 +407,9 @@ class Client(Connection):
         self.conn = conn
         self.addr = addr
 
+    def __del__(self):
+        self.conn.close()
+
 
 class ProxyError(Exception):
     pass
@@ -583,8 +586,8 @@ class Proxy(threading.Thread):
 
     def process(self):
         while True:
-            rlist, wlist, xlist = self.get_waitable_lists()
-            readable, writable, errored = select.select(rlist, wlist, xlist, 1)
+            read_list, write_list, error_list = self.get_waitable_lists()
+            readable, writable, errored = select.select(read_list, write_list, error_list, 1)
 
             self.process_writable(writable)
             if self.process_readable(readable):
