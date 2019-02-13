@@ -19,13 +19,14 @@ from contextlib import closing
 from proxy import HTTP, Proxy, ChunkParser, HttpParser, Client
 from proxy import ProxyAuthenticationFailed, ProxyConnectionFailed
 from proxy import CRLF, version, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT, \
-    DEFAULT_SERVER_RECVBUF_SIZE, DEFAULT_CLIENT_RECVBUF_SIZE
+    DEFAULT_SERVER_RECVBUF_SIZE, DEFAULT_CLIENT_RECVBUF_SIZE, DEFAULT_LOGGING_FORMAT
 
-# logging.basicConfig(level=logging.DEBUG,
-#                     format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
+logging.basicConfig(level=logging.DEBUG, format=DEFAULT_LOGGING_FORMAT)
 
 # True if we are running on Python 3.
-if sys.version_info[0] == 3:
+PY3 = sys.version_info[0] == 3
+
+if PY3:
     from http.server import HTTPServer, BaseHTTPRequestHandler
 else:
     from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
@@ -673,6 +674,7 @@ class TestWorkers(unittest.TestCase):
             except urllib.error.URLError:
                 logging.info('Connection refused, trying again')
 
+    @unittest.skipIf(not PY3, 'Skipped for PY2 due to PY3 only make_request version')
     def test_all_requests_are_proxied(self):
         for req_id in range(5):
             self.assertTrue(TestWorkers.make_request(self.http_server_port, self.proxy_server_port), b'OK')

@@ -72,7 +72,7 @@ def bytes_(s, encoding='utf-8', errors='strict'):   # pragma: no cover
 DEFAULT_SERVER_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_CLIENT_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_PROXY_CLIENT_TIMEOUT = 30   # seconds
-DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - pid:%(process)d - %(funcName)s:%(lineno)d - %(message)s'
+DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - %(process)d:%(thread)d - %(funcName)s:%(lineno)d - %(message)s'
 
 version = bytes_(__version__)
 CRLF, COLON, SP = b'\r\n', b':', b' '
@@ -342,8 +342,13 @@ class Connection(object):
     def __init__(self, what):
         self.conn = None
         self.buffer = b''
-        self.closed = False
+        self.closed = True
         self.what = what  # server or client
+
+    def __del__(self):
+        if self.conn and not self.closed:
+            logger.debug('closing %s connection', self.what)
+            self.close()
 
     def send(self, data):
         # TODO: Gracefully handle BrokenPipeError exceptions
@@ -356,6 +361,7 @@ class Connection(object):
                 logger.debug('rcvd 0 bytes from %s' % self.what)
                 return None
             logger.debug('rcvd %d bytes from %s' % (len(data), self.what))
+            # logger.debug(data)
             return data
         except Exception as e:
             if e.errno == errno.ECONNRESET:
@@ -391,12 +397,9 @@ class Server(Connection):
         super(Server, self).__init__(b'server')
         self.addr = (host, int(port))
 
-    def __del__(self):
-        if self.conn:
-            self.close()
-
     def connect(self):
         self.conn = socket.create_connection((self.addr[0], self.addr[1]))
+        self.closed = False
 
 
 class Client(Connection):
@@ -405,10 +408,8 @@ class Client(Connection):
     def __init__(self, conn, addr):
         super(Client, self).__init__(b'client')
         self.conn = conn
+        self.closed = False
         self.addr = addr
-
-    def __del__(self):
-        self.conn.close()
 
 
 class ProxyError(Exception):
@@ -534,14 +535,15 @@ class Proxy(threading.Thread):
                 self.response.code, self.response.reason, len(self.response.raw)))
 
     def get_waitable_lists(self):
-        rlist, wlist, xlist = [self.client.conn], [], []
+        read_list, write_list, error_list = [self.client.conn], [], [self.client.conn]
         if self.client.has_buffer():
-            wlist.append(self.client.conn)
+            write_list.append(self.client.conn)
         if self.server and not self.server.closed:
-            rlist.append(self.server.conn)
+            read_list.append(self.server.conn)
+            error_list.append(self.server.conn)
         if self.server and not self.server.closed and self.server.has_buffer():
-            wlist.append(self.server.conn)
-        return rlist, wlist, xlist
+            write_list.append(self.server.conn)
+        return read_list, write_list, error_list
 
     def process_writable(self, w):
         if self.client.conn in w:
@@ -587,20 +589,22 @@ class Proxy(threading.Thread):
     def process(self):
         while True:
             read_list, write_list, error_list = self.get_waitable_lists()
+            logger.debug('waiting for %d read streams, %d write streams, %d error streams',
+                         len(read_list), len(write_list), len(error_list))
             readable, writable, errored = select.select(read_list, write_list, error_list, 1)
+            if len(errored) > 0:
+                logger.critical('%d streams errored out', len(errored))
 
             self.process_writable(writable)
             if self.process_readable(readable):
                 break
 
-            if self.client.buffer_size() == 0:
-                if self.response.state == HttpParser.states.COMPLETE:
-                    logger.debug('client buffer is empty and response state is complete, breaking')
-                    break
-
-                if self.is_inactive():
-                    logger.debug('client buffer is empty and maximum inactivity has reached, breaking')
-                    break
+            if self.client.buffer_size() == 0 and (
+                    self.response.state == HttpParser.states.COMPLETE or self.is_inactive()):
+                logger.debug('client buffer size:0, response complete:%s, is_inactive:%s',
+                             'yes' if self.response.state == HttpParser.states.COMPLETE else 'no',
+                             'yes' if self.is_inactive() else 'no')
+                break
 
     @staticmethod
     def get_response_pkt_by_exception(e):
@@ -641,7 +645,7 @@ class TCP(object):
         self.backlog = backlog
         self.socket = None
 
-    def handle(self, client):
+    def handle(self, conn, addr):
         raise NotImplementedError()
 
     def shutdown(self):
@@ -659,8 +663,7 @@ class TCP(object):
                 readable, _, _ = select.select([self.socket], [], [], 1)
                 if self.socket in readable:
                     conn, addr = self.socket.accept()
-                    client = Client(conn, addr)
-                    self.handle(client)
+                    self.handle(conn, addr)
         except Exception as e:
             logger.exception('Exception while running the server %r' % e)
         finally:
@@ -702,9 +705,10 @@ class HTTP(TCP):
             worker.start()
             self.workers.append(worker)
 
-    def handle(self, client):
+    def handle(self, conn, addr):
         self.client_queue.put((Worker.operations.PROXY, {
-            'client': client,
+            'conn': conn,
+            'addr': addr,
             'auth_code': self.auth_code,
             'server_recvbuf_size': self.server_recvbuf_size,
             'client_recvbuf_size': self.client_recvbuf_size,
@@ -760,8 +764,10 @@ class Worker(multiprocessing.Process):
                 if operation == Worker.operations.SHUTDOWN:
                     break
                 elif operation == Worker.operations.PROXY:
-                    Worker.proxy(payload['client'], payload['auth_code'],
-                                 payload['server_recvbuf_size'], payload['client_recvbuf_size'])
+                    Worker.proxy(Client(payload['conn'], payload['addr']),
+                                 payload['auth_code'],
+                                 payload['server_recvbuf_size'],
+                                 payload['client_recvbuf_size'])
             except queue.Empty:
                 pass
             # Safeguard against https://gist.github.com/abhinavsingh/b8d4266ff4f38b6057f9c50075e8cd75
