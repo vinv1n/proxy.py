@@ -8,7 +8,6 @@
     :copyright: (c) 2013-2018 by Abhinav Singh.
     :license: BSD, see LICENSE for more details.
 """
-import sys
 import base64
 import socket
 import logging
@@ -18,13 +17,10 @@ from threading import Thread
 from contextlib import closing
 from proxy import HTTP, Proxy, ChunkParser, HttpParser, Client
 from proxy import ProxyAuthenticationFailed, ProxyConnectionFailed
-from proxy import CRLF, version, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT, \
+from proxy import version, PY3, CRLF, PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT, \
     DEFAULT_SERVER_RECVBUF_SIZE, DEFAULT_CLIENT_RECVBUF_SIZE, DEFAULT_LOGGING_FORMAT
 
 logging.basicConfig(level=logging.DEBUG, format=DEFAULT_LOGGING_FORMAT)
-
-# True if we are running on Python 3.
-PY3 = sys.version_info[0] == 3
 
 if PY3:
     from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -658,26 +654,24 @@ class TestWorkers(unittest.TestCase):
         cls.proxy_server_thread.join()
 
     @staticmethod
-    def make_request(http_server_port, proxy_server_port):
+    def make_request(request_url, proxy_server_port):
         proxy_address = 'http://127.0.0.1:%d' % proxy_server_port
         logging.info('Using proxy %s' % proxy_address)
         proxy = urllib.request.ProxyHandler({'http': proxy_address})
         opener = urllib.request.build_opener(proxy)
         urllib.request.install_opener(opener)
-        request_url = 'http://127.0.0.1:%d' % http_server_port
         logging.info('Making request to %s' % request_url)
-
-        while True:
-            try:
-                with closing(urllib.request.urlopen(request_url, timeout=1)) as response:
-                    return response.read()
-            except urllib.error.URLError:
-                logging.info('Connection refused, trying again')
+        return urllib.request.urlopen(request_url, timeout=1)
 
     @unittest.skipIf(not PY3, 'Skipped for PY2 due to PY3 only make_request version')
-    def test_all_requests_are_proxied(self):
-        for req_id in range(5):
-            self.assertTrue(TestWorkers.make_request(self.http_server_port, self.proxy_server_port), b'OK')
+    def test_request_via_proxied(self):
+        response = TestWorkers.make_request('http://127.0.0.1:%d' % self.http_server_port, self.proxy_server_port)
+        self.assertTrue(response.read(), b'OK')
+
+    @unittest.skipIf(not PY3, 'Skipped for PY2 due to PY3 only make_request version')
+    def test_502_bad_gateway(self):
+        with self.assertRaises(urllib.error.HTTPError):
+            TestWorkers.make_request('http://unknown.domain', self.proxy_server_port)
 
 
 if __name__ == '__main__':

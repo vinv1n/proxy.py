@@ -72,6 +72,7 @@ def bytes_(s, encoding='utf-8', errors='strict'):   # pragma: no cover
 DEFAULT_SERVER_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_CLIENT_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_PROXY_CLIENT_TIMEOUT = 30   # seconds
+DEFAULT_SERVER_CONNECT_TIMEOUT = 30     # seconds
 DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - %(process)d:%(thread)d - %(funcName)s:%(lineno)d - %(message)s'
 
 version = bytes_(__version__)
@@ -397,8 +398,8 @@ class Server(Connection):
         super(Server, self).__init__(b'server')
         self.addr = (host, int(port))
 
-    def connect(self):
-        self.conn = socket.create_connection((self.addr[0], self.addr[1]))
+    def connect(self, timeout=DEFAULT_SERVER_CONNECT_TIMEOUT):
+        self.conn = socket.create_connection((self.addr[0], self.addr[1]), timeout=timeout)
         self.closed = False
 
 
@@ -438,6 +439,7 @@ class Proxy(threading.Thread):
     """
 
     def __init__(self, client, auth_code=None,
+                 server_connect_timeout=DEFAULT_SERVER_CONNECT_TIMEOUT,
                  server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
                  client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
         super(Proxy, self).__init__()
@@ -453,6 +455,13 @@ class Proxy(threading.Thread):
 
         self.request = HttpParser(HttpParser.types.REQUEST_PARSER)
         self.response = HttpParser(HttpParser.types.RESPONSE_PARSER)
+
+    @staticmethod
+    def get_response_pkt_by_exception(e):
+        if e.__class__.__name__ == 'ProxyAuthenticationFailed':
+            return PROXY_AUTHENTICATION_REQUIRED_RESPONSE_PKT
+        if e.__class__.__name__ == 'ProxyConnectionFailed':
+            return BAD_GATEWAY_RESPONSE_PKT
 
     @staticmethod
     def now():
@@ -495,12 +504,10 @@ class Proxy(threading.Thread):
 
             self.server = Server(host, port)
             try:
-                logger.debug('connecting to server %s:%s' % (host, port))
-                self.server.connect()
+                self.server.connect(self.server_connect_timeout)
                 logger.debug('connected to server %s:%s' % (host, port))
-            except Exception as e:  # TimeoutError, socket.gaierror
-                self.server.closed = True
-                raise ProxyConnectionFailed(host, port, repr(e))
+            except (TimeoutError, socket.gaierror) as e:
+                raise ProxyConnectionFailed(host, port, repr(e)) from e
 
             # for http connect methods (https requests)
             # queue appropriate response for client
@@ -523,16 +530,6 @@ class Proxy(threading.Thread):
 
         # queue data for client
         self.client.queue(data)
-
-    def access_log(self):
-        host, port = self.server.addr if self.server else (None, None)
-        if self.request.method == b'CONNECT':
-            logger.info(
-                '%s:%s - %s %s:%s' % (self.client.addr[0], self.client.addr[1], self.request.method, host, port))
-        elif self.request.method:
-            logger.info('%s:%s - %s %s:%s%s - %s %s - %s bytes' % (
-                self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.build_url(),
-                self.response.code, self.response.reason, len(self.response.raw)))
 
     def get_waitable_lists(self):
         read_list, write_list, error_list = [self.client.conn], [], [self.client.conn]
@@ -570,6 +567,9 @@ class Proxy(threading.Thread):
             except (ProxyAuthenticationFailed, ProxyConnectionFailed) as e:
                 logger.exception(e)
                 self.client.queue(Proxy.get_response_pkt_by_exception(e))
+                # TODO(abhinavsingh): Due to exceptions we need to drop client connection
+                # but also send exception response back to client. Calling .flush() below
+                # will most likely be a blocking call, as client is not ready for writes.
                 self.client.flush()
                 return True
 
@@ -606,12 +606,15 @@ class Proxy(threading.Thread):
                              'yes' if self.is_inactive() else 'no')
                 break
 
-    @staticmethod
-    def get_response_pkt_by_exception(e):
-        if e.__class__.__name__ == 'ProxyAuthenticationFailed':
-            return PROXY_AUTHENTICATION_REQUIRED_RESPONSE_PKT
-        if e.__class__.__name__ == 'ProxyConnectionFailed':
-            return BAD_GATEWAY_RESPONSE_PKT
+    def access_log(self):
+        host, port = self.server.addr if self.server else (None, None)
+        if self.request.method == b'CONNECT':
+            logger.info(
+                '%s:%s - %s %s:%s' % (self.client.addr[0], self.client.addr[1], self.request.method, host, port))
+        elif self.request.method:
+            logger.info('%s:%s - %s %s:%s%s - %s %s - %s bytes' % (
+                self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.build_url(),
+                self.response.code, self.response.reason, len(self.response.raw)))
 
     def run(self):
         logger.debug('Proxying connection %r' % self.client.conn)
@@ -683,12 +686,14 @@ class HTTP(TCP):
     """
 
     def __init__(self, hostname='127.0.0.1', port=8899, backlog=100, num_workers=0,
+                 server_connect_timeout=DEFAULT_SERVER_CONNECT_TIMEOUT,
                  auth_code=None, server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
                  client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
         super(HTTP, self).__init__(hostname, port, backlog)
         self.auth_code = auth_code
         self.client_recvbuf_size = client_recvbuf_size
         self.server_recvbuf_size = server_recvbuf_size
+        self.server_connect_timeout = server_connect_timeout
 
         self.client_queue = multiprocessing.Queue()
 
@@ -710,6 +715,7 @@ class HTTP(TCP):
             'conn': conn,
             'addr': addr,
             'auth_code': self.auth_code,
+            'server_connect_timeout': self.server_connect_timeout,
             'server_recvbuf_size': self.server_recvbuf_size,
             'client_recvbuf_size': self.client_recvbuf_size,
         }))
@@ -748,10 +754,11 @@ class Worker(multiprocessing.Process):
         self.client_queue = client_queue
 
     @staticmethod
-    def proxy(client, auth_code=None,
+    def proxy(client, auth_code=None, server_connect_timeout=DEFAULT_SERVER_CONNECT_TIMEOUT,
               server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
               client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
         p = Proxy(client, auth_code=auth_code,
+                  server_connect_timeout=server_connect_timeout,
                   server_recvbuf_size=server_recvbuf_size,
                   client_recvbuf_size=client_recvbuf_size)
         p.daemon = True
@@ -799,17 +806,19 @@ def main():
                              'Maximum number of pending connections '
                              'to proxy server.')
     parser.add_argument('--num-workers', type=int, default=0, help='Default: Number of CPU cores.')
+    parser.add_argument('--server-connect-timeout', type=int, default=DEFAULT_SERVER_CONNECT_TIMEOUT,
+                        help='Default: 30 seconds. Timeout when connecting to upstream servers.')
     parser.add_argument('--basic-auth', type=str, default=None,
                         help='Default: No authentication. '
                              'Specify colon separated user:password '
                              'to enable basic authentication.')
-    parser.add_argument('--server-recvbuf-size', type=int, default=0,
+    parser.add_argument('--server-recvbuf-size', type=int, default=DEFAULT_SERVER_RECVBUF_SIZE,
                         help='Default: 1 MB. '
                              'Maximum amount of data received from the '
                              'server in a single recv() operation. Bump this '
                              'value for faster downloads at the expense of '
                              'increased RAM.')
-    parser.add_argument('--client-recvbuf-size', type=int, default=0,
+    parser.add_argument('--client-recvbuf-size', type=int, default=DEFAULT_CLIENT_RECVBUF_SIZE,
                         help='Default: 1 MB. '
                              'Maximum amount of data received from the '
                              'client in a single recv() operation. Bump this '
@@ -832,21 +841,14 @@ def main():
         if args.basic_auth:
             auth_code = b'Basic %s' % base64.b64encode(bytes_(args.basic_auth))
 
-        server_recvbuf_size = DEFAULT_SERVER_RECVBUF_SIZE
-        if args.server_recvbuf_size > 0:
-            server_recvbuf_size = args.server_recvbuf_size
-
-        client_recvbuf_size = DEFAULT_CLIENT_RECVBUF_SIZE
-        if args.client_recvbuf_size > 0:
-            client_recvbuf_size = args.client_recvbuf_size
-
         proxy = HTTP(hostname=args.hostname,
                      port=args.port,
                      backlog=args.backlog,
                      num_workers=args.num_workers,
+                     server_connect_timeout=args.server_connect_timeout,
                      auth_code=auth_code,
-                     server_recvbuf_size=server_recvbuf_size,
-                     client_recvbuf_size=client_recvbuf_size)
+                     server_recvbuf_size=args.server_recvbuf_size,
+                     client_recvbuf_size=args.client_recvbuf_size)
         proxy.run()
     except KeyboardInterrupt:
         pass
