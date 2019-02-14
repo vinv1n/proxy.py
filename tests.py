@@ -450,7 +450,7 @@ class TestProxy(unittest.TestCase):
     def setUp(self):
         self._conn = MockConnection()
         self._addr = ('127.0.0.1', 54382)
-        self.proxy = Proxy(Client(self._conn, self._addr))
+        self.proxy = Proxy(self._conn, self._addr)
 
     def test_http_get(self):
         # Send request line
@@ -533,7 +533,7 @@ class TestProxy(unittest.TestCase):
             ]))
 
     def test_proxy_authentication_failed(self):
-        self.proxy = Proxy(Client(self._conn, self._addr), b'Basic %s' % base64.b64encode(b'user:pass'))
+        self.proxy = Proxy(self._conn, self._addr, auth_code=b'Basic %s' % base64.b64encode(b'user:pass'))
 
         with self.assertRaises(ProxyAuthenticationFailed):
             self.proxy.process_request(CRLF.join([
@@ -543,7 +543,7 @@ class TestProxy(unittest.TestCase):
             ]))
 
     def test_authenticated_proxy_http_get(self):
-        self.proxy = Proxy(Client(self._conn, self._addr), b'Basic %s' % base64.b64encode(b'user:pass'))
+        self.proxy = Proxy(self._conn, self._addr, auth_code=b'Basic %s' % base64.b64encode(b'user:pass'))
 
         self.proxy.client.conn.queue((b'GET http://localhost:%d HTTP/1.1' % self.http_server_port) + CRLF)
         self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
@@ -576,7 +576,7 @@ class TestProxy(unittest.TestCase):
         self.assertEqual(int(self.proxy.response.code), 200)
 
     def test_authenticated_proxy_http_tunnel(self):
-        self.proxy = Proxy(Client(self._conn, self._addr), b'Basic %s' % base64.b64encode(b'user:pass'))
+        self.proxy = Proxy(self._conn, self._addr, auth_code=b'Basic %s' % base64.b64encode(b'user:pass'))
 
         self.proxy.client.conn.queue(CRLF.join([
             b'CONNECT localhost:%d HTTP/1.1' % self.http_server_port,

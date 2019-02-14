@@ -71,7 +71,7 @@ def bytes_(s, encoding='utf-8', errors='strict'):   # pragma: no cover
 
 DEFAULT_SERVER_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_CLIENT_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
-DEFAULT_PROXY_CLIENT_TIMEOUT = 30   # seconds
+DEFAULT_MAX_CLIENT_INACTIVITY = 30   # seconds
 DEFAULT_SERVER_CONNECT_TIMEOUT = 30     # seconds
 DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - %(process)d:%(thread)d - %(funcName)s:%(lineno)d - %(message)s'
 
@@ -438,7 +438,7 @@ class Proxy(threading.Thread):
     Accepts `Client` connection object and act as a proxy between client and server.
     """
 
-    def __init__(self, client, auth_code=None,
+    def __init__(self, conn, addr, auth_code=None,
                  server_connect_timeout=DEFAULT_SERVER_CONNECT_TIMEOUT,
                  server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
                  client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
@@ -448,10 +448,11 @@ class Proxy(threading.Thread):
         self.last_activity = self.start_time
 
         self.auth_code = auth_code
-        self.client = client
+        self.client = Client(conn, addr)
         self.client_recvbuf_size = client_recvbuf_size
         self.server = None
         self.server_recvbuf_size = server_recvbuf_size
+        self.server_connect_timeout = server_connect_timeout
 
         self.request = HttpParser(HttpParser.types.REQUEST_PARSER)
         self.response = HttpParser(HttpParser.types.RESPONSE_PARSER)
@@ -471,7 +472,7 @@ class Proxy(threading.Thread):
         return (Proxy.now() - self.last_activity).seconds
 
     def is_inactive(self):
-        return self.inactive_for() > DEFAULT_PROXY_CLIENT_TIMEOUT
+        return self.inactive_for() > DEFAULT_MAX_CLIENT_INACTIVITY
 
     def process_request(self, data):
         # once we have connection to the server
@@ -754,10 +755,10 @@ class Worker(multiprocessing.Process):
         self.client_queue = client_queue
 
     @staticmethod
-    def proxy(client, auth_code=None, server_connect_timeout=DEFAULT_SERVER_CONNECT_TIMEOUT,
+    def proxy(conn, addr, auth_code=None, server_connect_timeout=DEFAULT_SERVER_CONNECT_TIMEOUT,
               server_recvbuf_size=DEFAULT_SERVER_RECVBUF_SIZE,
               client_recvbuf_size=DEFAULT_CLIENT_RECVBUF_SIZE):
-        p = Proxy(client, auth_code=auth_code,
+        p = Proxy(conn, addr, auth_code=auth_code,
                   server_connect_timeout=server_connect_timeout,
                   server_recvbuf_size=server_recvbuf_size,
                   client_recvbuf_size=client_recvbuf_size)
@@ -771,7 +772,8 @@ class Worker(multiprocessing.Process):
                 if operation == Worker.operations.SHUTDOWN:
                     break
                 elif operation == Worker.operations.PROXY:
-                    Worker.proxy(Client(payload['conn'], payload['addr']),
+                    Worker.proxy(payload['conn'],
+                                 payload['addr'],
                                  payload['auth_code'],
                                  payload['server_recvbuf_size'],
                                  payload['client_recvbuf_size'])
