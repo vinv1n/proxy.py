@@ -73,7 +73,7 @@ DEFAULT_SERVER_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_CLIENT_RECVBUF_SIZE = 1024 * 1024   # 1 Mb
 DEFAULT_MAX_CLIENT_INACTIVITY = 30   # seconds
 DEFAULT_SERVER_CONNECT_TIMEOUT = 30     # seconds
-DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - %(process)d:%(thread)d - %(funcName)s:%(lineno)d - %(message)s'
+DEFAULT_LOGGING_FORMAT = '%(asctime)s - %(levelname)s - %(process)d:%(funcName)s:%(lineno)d - %(message)s'
 
 version = bytes_(__version__)
 CRLF, COLON, SP = b'\r\n', b':', b' '
@@ -545,17 +545,17 @@ class Proxy(threading.Thread):
 
     def process_writable(self, w):
         if self.client.conn in w:
-            logger.debug('client is ready for writes, flushing client buffer')
+            # logger.debug('client is ready for writes, flushing client buffer')
             self.client.flush()
 
         if self.server and not self.server.closed and self.server.conn in w:
-            logger.debug('server is ready for writes, flushing server buffer')
+            # logger.debug('server is ready for writes, flushing server buffer')
             self.server.flush()
 
     def process_readable(self, r):
         """Returns True if connection to client must be closed."""
         if self.client.conn in r:
-            logger.debug('client is ready for reads, reading')
+            # logger.debug('client is ready for reads, reading')
             data = self.client.recv(self.client_recvbuf_size)
             self.last_activity = Proxy.now()
 
@@ -575,7 +575,7 @@ class Proxy(threading.Thread):
                 return True
 
         if self.server and not self.server.closed and self.server.conn in r:
-            logger.debug('server is ready for reads, reading')
+            # logger.debug('server is ready for reads, reading')
             data = self.server.recv(self.server_recvbuf_size)
             self.last_activity = Proxy.now()
 
@@ -590,8 +590,8 @@ class Proxy(threading.Thread):
     def process(self):
         while True:
             read_list, write_list, error_list = self.get_waitable_lists()
-            logger.debug('waiting for %d read streams, %d write streams, %d error streams',
-                         len(read_list), len(write_list), len(error_list))
+            # logger.debug('waiting for %d read streams, %d write streams, %d error streams',
+            #              len(read_list), len(write_list), len(error_list))
             readable, writable, errored = select.select(read_list, write_list, error_list, 1)
             if len(errored) > 0:
                 logger.critical('%d streams errored out', len(errored))
@@ -627,11 +627,9 @@ class Proxy(threading.Thread):
             logger.exception('Exception while handling connection %r with reason %r' % (self.client.conn, e))
         finally:
             logger.debug(
-                'closing client connection with pending client buffer size %d bytes' % self.client.buffer_size())
+                'closing client connection with pending client buffer size %d bytes, server buffer size %d bytes' %
+                (self.client.buffer_size(), self.server.buffer_size() if self.server else 0))
             self.client.close()
-            if self.server:
-                logger.debug(
-                    'closed client connection with pending server buffer size %d bytes' % self.server.buffer_size())
             self.access_log()
             logger.debug('Closing proxy for connection %r at address %r' % (self.client.conn, self.client.addr))
 
@@ -734,7 +732,7 @@ class HTTP(TCP):
 
 
 class Worker(multiprocessing.Process):
-    """Proxy worker runs in a separate process
+    """Proxy worker runs in a separate processes
     and spawns Proxy threads for received client request.
 
     Accepted client requests are queued over `client_queue`
@@ -832,10 +830,15 @@ def main():
                              'that proxy.py can open concurrently.')
     parser.add_argument('--log-level', type=str, default='INFO',
                         help='DEBUG, INFO (default), WARNING, ERROR, CRITICAL.')
-    parser.add_argument('--version', default=version, help='Print proxy.py version.')
+    parser.add_argument('--version', action='store_true', help='Print proxy.py version.')
     args = parser.parse_args()
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format=DEFAULT_LOGGING_FORMAT)
+
+    if args.version:
+        print(text_(version))
+        sys.exit(0)
+
     try:
         set_open_file_limit(args.open_file_limit)
 
