@@ -2,7 +2,7 @@ SHELL := /bin/bash
 
 NS := abhinavsingh
 IMAGE_NAME := proxy.py
-VERSION := "v"$(shell ./proxy.py --version)
+VERSION := v$(shell ./proxy.py --version)
 IMAGE_TAG := $(NS)/$(IMAGE_NAME):$(VERSION)
 
 .PHONY: all clean test package test-release release coverage flake8 container run-container release-container
