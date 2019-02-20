@@ -508,7 +508,7 @@ class Proxy(threading.Thread):
                 self.server.connect(self.server_connect_timeout)
                 logger.debug('connected to server %s:%s' % (host, port))
             except (TimeoutError, socket.gaierror) as e:
-                raise ProxyConnectionFailed(host, port, repr(e)) from e
+                raise ProxyConnectionFailed(host, port, repr(e))
 
             # for http connect methods (https requests)
             # queue appropriate response for client
@@ -561,6 +561,7 @@ class Proxy(threading.Thread):
 
             if not data:
                 logger.debug('client closed connection, breaking')
+                self.client.close()
                 return True
 
             try:
@@ -629,7 +630,10 @@ class Proxy(threading.Thread):
             logger.debug(
                 'closing client connection with pending client buffer size %d bytes, server buffer size %d bytes' %
                 (self.client.buffer_size(), self.server.buffer_size() if self.server else 0))
-            self.client.close()
+            if self.client and not self.client.closed:
+                self.client.close()
+            if self.server and not self.server.closed:
+                self.server.close()
             self.access_log()
             logger.debug('Closing proxy for connection %r at address %r' % (self.client.conn, self.client.addr))
 
@@ -641,7 +645,7 @@ class TCP(object):
     """
 
     def __init__(self, hostname='127.0.0.1', port=8899, backlog=100):
-        self.running = True
+        self.running = False
         self.hostname = hostname
         self.port = port
         self.backlog = backlog
@@ -654,6 +658,7 @@ class TCP(object):
         pass
 
     def run(self):
+        self.running = True
         try:
             logger.info('Starting proxy.py on port %d' % self.port)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -670,8 +675,9 @@ class TCP(object):
             logger.exception('Exception while running the server %r' % e)
         finally:
             self.shutdown()
-            logger.info('Closing server socket')
+            self.running = False
             self.socket.close()
+            logger.info('Closed server socket')
 
     def stop(self):
         self.running = False

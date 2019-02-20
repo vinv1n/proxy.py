@@ -5,6 +5,7 @@
 .settings
 *.pyc
 venv
+venv2
 cover
 htmlcov
 dist

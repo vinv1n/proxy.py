@@ -644,6 +644,13 @@ class TestWorkers(unittest.TestCase):
     def setUpClass(cls):
         cls.http_server_port, cls.http_server, cls.http_server_thread = start_http_server()
         cls.proxy_server_port, cls.proxy_server, cls.proxy_server_thread = start_proxy_server()
+        # Wait until http and proxy server setup is up
+        while True:
+            try:
+                _ = TestWorkers.make_request('http://127.0.0.1:%d' % cls.http_server_port, cls.proxy_server_port)
+                break
+            except urllib.error.URLError:
+                pass
 
     @classmethod
     def tearDownClass(cls):
