@@ -474,139 +474,170 @@ class Proxy(threading.Thread):
     def is_inactive(self):
         return self.inactive_for() > DEFAULT_MAX_CLIENT_INACTIVITY
 
-    def process_request(self, data):
-        # once we have connection to the server
-        # we don't parse the http request packets
-        # any further, instead just pipe incoming
-        # data from client to server
-        if self.server and not self.server.closed:
-            self.server.queue(data)
-            return
+    def verify_auth_code(self):
+        if self.auth_code:
+            if b'proxy-authorization' not in self.request.headers or \
+                    self.request.headers[b'proxy-authorization'][1] != self.auth_code:
+                raise ProxyAuthenticationFailed()
 
-        # parse http request
-        self.request.parse(data)
+    def read_once(self):
+        """Read once from client.
 
-        # once http request parser has reached the state complete
-        # we attempt to establish connection to destination server
-        if self.request.state == HttpParser.states.COMPLETE:
-            logger.debug('request parser is in state complete')
+        :return: Data sent by client.
+        None if client closed connection
+        False if client is not ready for reads yet.
+        """
+        readable, _, _ = select.select([self.client.conn], [], [], 1)
+        if self.client.conn not in readable:
+            return False
 
-            if self.auth_code:
-                if b'proxy-authorization' not in self.request.headers or \
-                        self.request.headers[b'proxy-authorization'][1] != self.auth_code:
-                    raise ProxyAuthenticationFailed()
+        data = self.client.recv(self.client_recvbuf_size)
+        self.last_activity = Proxy.now()
+        if not data:
+            logger.debug('client closed connection, breaking')
+            return None
+        
+        return data
 
-            if self.request.method == b'CONNECT':
-                host, port = self.request.url.netloc.split(COLON)
-            elif self.request.url:
-                host, port = self.request.url.hostname, self.request.url.port if self.request.url.port else 80
-            else:
-                raise Exception('Invalid request\n%s' % self.request.raw)
+    def tunnel(self):
+        """Tunnel method acts as a transparent proxy between client and server."""
+        while True:
+            writable = []
+            if self.client.has_buffer():
+                writable.append(self.client.conn)
+            if not self.server.closed and self.server.has_buffer():
+                writable.append(self.server.conn)
 
-            self.server = Server(host, port)
-            try:
-                self.server.connect(self.server_connect_timeout)
-                logger.debug('connected to server %s:%s' % (host, port))
-            except (TimeoutError, socket.gaierror) as e:
-                raise ProxyConnectionFailed(host, port, repr(e))
+            # Always read from client and server to detect connection close events
+            readable, writable, _ = select.select([self.client.conn, self.server.conn], writable, [], 1)
 
-            # for http connect methods (https requests)
-            # queue appropriate response for client
-            # notifying about established connection
-            if self.request.method == b'CONNECT':
-                self.client.queue(PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT)
-            # for usual http requests, re-build request packet
-            # and queue for the server with appropriate headers
-            else:
-                self.server.queue(self.request.build(
-                    del_headers=[b'proxy-authorization', b'proxy-connection', b'connection', b'keep-alive'],
-                    add_headers=[(b'Via', b'1.1 proxy.py v%s' % version), (b'Connection', b'Close')]
-                ))
-
-    def process_response(self, data):
-        # parse incoming response packet
-        # only for non-https requests
-        if not self.request.method == b'CONNECT':
-            self.response.parse(data)
-
-        # queue data for client
-        self.client.queue(data)
-
-    def get_waitable_lists(self):
-        read_list, write_list, error_list = [self.client.conn], [], [self.client.conn]
-        if self.client.has_buffer():
-            write_list.append(self.client.conn)
-        if self.server and not self.server.closed:
-            read_list.append(self.server.conn)
-            error_list.append(self.server.conn)
-        if self.server and not self.server.closed and self.server.has_buffer():
-            write_list.append(self.server.conn)
-        return read_list, write_list, error_list
-
-    def process_writable(self, w):
-        if self.client.conn in w:
-            # logger.debug('client is ready for writes, flushing client buffer')
-            self.client.flush()
-
-        if self.server and not self.server.closed and self.server.conn in w:
-            # logger.debug('server is ready for writes, flushing server buffer')
-            self.server.flush()
-
-    def process_readable(self, r):
-        """Returns True if connection to client must be closed."""
-        if self.client.conn in r:
-            # logger.debug('client is ready for reads, reading')
-            data = self.client.recv(self.client_recvbuf_size)
-            self.last_activity = Proxy.now()
-
-            if not data:
-                logger.debug('client closed connection, breaking')
-                self.client.close()
-                return True
-
-            try:
-                self.process_request(data)
-            except (ProxyAuthenticationFailed, ProxyConnectionFailed) as e:
-                logger.exception(e)
-                self.client.queue(Proxy.get_response_pkt_by_exception(e))
-                # TODO(abhinavsingh): Due to exceptions we need to drop client connection
-                # but also send exception response back to client. Calling .flush() below
-                # will most likely be a blocking call, as client is not ready for writes.
+            # Flush client and server buffers
+            if self.client.conn in writable:
+                self.last_activity = Proxy.now()
                 self.client.flush()
-                return True
+            if self.server.conn in writable:
+                self.server.flush()
 
-        if self.server and not self.server.closed and self.server.conn in r:
-            # logger.debug('server is ready for reads, reading')
-            data = self.server.recv(self.server_recvbuf_size)
-            self.last_activity = Proxy.now()
+            # Buffer client and server data for respective ends
+            if self.client.conn in readable:
+                data = self.client.recv(self.client_recvbuf_size)
+                self.last_activity = Proxy.now()
+                if not data:
+                    logger.debug('client closed connection, breaking')
+                    break
+                self.server.queue(data)
+            if self.server.conn in readable:
+                data = self.server.recv(self.server_recvbuf_size)
+                if not data:
+                    logger.debug('server closed connection, breaking')
+                    break
+                self.response.parse(data)
+                self.client.queue(data)
 
-            if not data:
-                logger.debug('server closed connection')
-                self.server.close()
-            else:
-                self.process_response(data)
+    def proxy_https_request(self):
+        """Handles https protocol proxy.
 
-        return False
+        Establish connection with the remote server and
+        return PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT to the client.
+        From here on, transparently act as a tunnel between client and server.
+        """
+        host, port = self.request.url.netloc.split(COLON)
+        self.server = Server(host, port)
+        try:
+            self.server.connect(self.server_connect_timeout)
+            logger.debug('connected to server %s:%s' % (host, port))
+        except (TimeoutError, socket.gaierror) as e:
+            raise ProxyConnectionFailed(host, port, repr(e))
+
+        self.client.queue(PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT)
+
+        self.tunnel()
+
+    def proxy_http_request(self):
+        """Establish connection with the remote server and
+        proxy client request to remote server.
+
+        Going forward:
+        --------------
+        We will stream incoming request from the client to the server,
+        instead of buffering entire request from client in memory.
+        This can also lead to scenarios where remote server can close the
+        connection prematurely without waiting to receive the entire request.
+
+        For Http requests, request packet is parsed by
+        HttpParser. As the request gets parsed, header-by-header
+        and then chunk-by-chunk of body is progressively streamed
+        to the remote server, while also listening for response from
+        the remote server.
+
+        If remote server accepts the whole request, identified by
+        HttpParser.states.COMPLETE, server response is again parsed
+        by HttpParser and streamed to the client.
+        """
+        host, port = self.request.url.hostname, self.request.url.port if self.request.url.port else 80
+        self.server = Server(host, port)
+        try:
+            self.server.connect(self.server_connect_timeout)
+            logger.debug('connected to server %s:%s' % (host, port))
+        except (TimeoutError, socket.gaierror) as e:
+            raise ProxyConnectionFailed(host, port, repr(e))
+
+        while self.request.state != HttpParser.states.COMPLETE:
+            data = self.read_once()
+            if data is None:
+                return
+            self.request.parse(data)
+
+        self.server.queue(self.request.build(
+            del_headers=[b'proxy-authorization', b'proxy-connection', b'connection', b'keep-alive'],
+            add_headers=[(b'Via', b'1.1 proxy.py v%s' % version), (b'Connection', b'Close')]
+        ))
+
+        self.tunnel()
+
+    def handle_server_request(self):
+        while self.request.state != HttpParser.states.COMPLETE:
+            data = self.read_once()
+            if data is None:
+                break
+            self.request.parse(data)
+
+        self.client.queue(b'HTTP/1.1 200 OK\r\nContent-Length:8\r\n\r\nproxy.py')
+        while self.client.has_buffer():
+            _, writable, _ = select.select([], [self.client.conn], [], 1)
+            if self.client.conn in writable:
+                self.client.flush()
 
     def process(self):
+        """Read client request method line.
+
+        We need to inspect request line to differentiate between
+        http vs https requests. Also, identify requests made to
+        the proxy.py web server itself.
+        """
+        handler = None
+
         while True:
-            read_list, write_list, error_list = self.get_waitable_lists()
-            # logger.debug('waiting for %d read streams, %d write streams, %d error streams',
-            #              len(read_list), len(write_list), len(error_list))
-            readable, writable, errored = select.select(read_list, write_list, error_list, 1)
-            if len(errored) > 0:
-                logger.critical('%d streams errored out', len(errored))
-
-            self.process_writable(writable)
-            if self.process_readable(readable):
+            data = self.read_once()
+            if data is None:
                 break
 
-            if self.client.buffer_size() == 0 and (
-                    self.response.state == HttpParser.states.COMPLETE or self.is_inactive()):
-                logger.debug('client buffer size:0, response complete:%s, is_inactive:%s',
-                             'yes' if self.response.state == HttpParser.states.COMPLETE else 'no',
-                             'yes' if self.is_inactive() else 'no')
+            self.request.parse(data)
+
+            if self.request.state >= HttpParser.states.LINE_RCVD:
+                if self.request.method == b'CONNECT':
+                    handler = self.proxy_https_request
+                elif self.request.url:
+                    if self.request.url.netloc != b'':
+                        handler = self.proxy_http_request
+                    else:
+                        handler = self.handle_server_request
+                else:
+                    raise Exception('Invalid request\n%s' % self.request.raw)
                 break
+
+        if handler:
+            handler()
 
     def access_log(self):
         host, port = self.server.addr if self.server else (None, None)
