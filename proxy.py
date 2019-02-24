@@ -11,6 +11,7 @@
 """
 import os
 import sys
+import math
 import errno
 import queue
 import base64
@@ -100,6 +101,43 @@ PROXY_AUTHENTICATION_REQUIRED_RESPONSE_PKT = CRLF.join([
     b'Connection: close',
     CRLF
 ]) + b'Proxy Authentication Required'
+
+
+class Bandwidth(object):
+    """Bandwidth enforcement class.
+
+    Based upon token bucket algorithm, use it to enforce
+    bandwidth restrictions for client <-> server connection.
+    """
+
+    def __init__(self, bandwidth, refill_time, refill_amount):
+        """
+        Bandwidth class initialization.
+
+        :param bandwidth: Bandwidth in bytes per second.
+        :param refill_time: Amount of time between token fills.
+        :param refill_amount: Amount of tokens to fill.
+        """
+        self.bandwidth = bandwidth
+        self.refill_time = refill_time
+        self.refill_amount = refill_amount
+
+        self.value = self.bandwidth
+        self.last_update = Bandwidth.now()
+
+    @staticmethod
+    def now():
+        return datetime.datetime.utcnow()
+
+    def reduce(self, bps):
+        refills = math.floor((Bandwidth.now() - self.last_update) / self.refill_time)
+        self.value = min(self.refill_amount, refills)
+        self.last_update = min(Bandwidth.now(), self.last_update + refills * self.refill_time)
+
+        if bps >= self.value:
+            return False
+        self.value -= bps
+        return True
 
 
 class ChunkParser(object):
@@ -348,7 +386,6 @@ class Connection(object):
 
     def __del__(self):
         if self.conn and not self.closed:
-            logger.debug('closing %s connection', self.what)
             self.close()
 
     def send(self, data):
@@ -373,6 +410,12 @@ class Connection(object):
             return None
 
     def close(self):
+        logger.debug('closing %s connection', self.what)
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError as e:
+            if e.errno != errno.ENOTCONN:
+                raise e
         self.conn.close()
         self.closed = True
 
@@ -496,11 +539,11 @@ class Proxy(threading.Thread):
         if not data:
             logger.debug('client closed connection, breaking')
             return None
-        
+
         return data
 
     def tunnel(self):
-        """Tunnel method acts as a transparent proxy between client and server."""
+        """Tunnel establish a transparent connection between client and server."""
         while True:
             writable = []
             if self.client.has_buffer():
@@ -515,6 +558,12 @@ class Proxy(threading.Thread):
             if self.client.conn in writable:
                 self.last_activity = Proxy.now()
                 self.client.flush()
+                if self.response.state == HttpParser.states.COMPLETE:
+                    if self.explicit_close_requested():
+                        logging.debug('Explicit close was requested by client')
+                        self.client.close()
+                        self.server.close()
+                        break
             if self.server.conn in writable:
                 self.server.flush()
 
@@ -532,6 +581,7 @@ class Proxy(threading.Thread):
                     logger.debug('server closed connection, breaking')
                     break
                 self.response.parse(data)
+                logging.debug('Response parser state: %d', self.response.state)
                 self.client.queue(data)
 
     def proxy_https_request(self):
@@ -552,6 +602,14 @@ class Proxy(threading.Thread):
         self.client.queue(PROXY_TUNNEL_ESTABLISHED_RESPONSE_PKT)
 
         self.tunnel()
+
+    def explicit_close_requested(self):
+        return b'connection' in self.request.headers and self.request.headers[b'connection'] == b'close'
+
+    def is_http_1_1_pipeline(self):
+        return (b'connection' in self.request.headers and
+                self.request.headers[b'connection'] == b'keep-alive') or \
+                b'keep-alive' in self.request.headers
 
     def proxy_http_request(self):
         """Establish connection with the remote server and
@@ -586,20 +644,40 @@ class Proxy(threading.Thread):
             data = self.read_once()
             if data is None:
                 return
+            if data is False:
+                continue
             self.request.parse(data)
+            logging.debug('Request parser state: %d', self.request.state)
+
+        del_headers = [b'proxy-authorization', b'proxy-connection', b'connection', b'keep-alive']
+        add_headers = [(b'Via', b'1.1 proxy.py v%s' % version)]
+
+        if self.request.version.lower() == 'HTTP/1.1':
+            if self.is_http_1_1_pipeline():
+                # Only add "Connection: keep-alive" only if client
+                # didn't set an explicit "Keep-alive" header
+                if b'keep-alive' not in self.request.headers:
+                    add_headers.append((b'Connection', b'keep-alive'))
+            else:
+                add_headers.append((b'Connection', b'close'))
 
         self.server.queue(self.request.build(
-            del_headers=[b'proxy-authorization', b'proxy-connection', b'connection', b'keep-alive'],
-            add_headers=[(b'Via', b'1.1 proxy.py v%s' % version), (b'Connection', b'Close')]
+            del_headers=del_headers,
+            add_headers=add_headers
         ))
 
         self.tunnel()
 
     def handle_server_request(self):
+        """Handles incoming requests to proxy web server."""
         while self.request.state != HttpParser.states.COMPLETE:
             data = self.read_once()
             if data is None:
                 break
+
+            if data is False:
+                continue
+
             self.request.parse(data)
 
         self.client.queue(b'HTTP/1.1 200 OK\r\nContent-Length:8\r\n\r\nproxy.py')
@@ -607,6 +685,7 @@ class Proxy(threading.Thread):
             _, writable, _ = select.select([], [self.client.conn], [], 1)
             if self.client.conn in writable:
                 self.client.flush()
+        self.client.close()
 
     def process(self):
         """Read client request method line.
@@ -622,7 +701,11 @@ class Proxy(threading.Thread):
             if data is None:
                 break
 
+            if data is False:
+                continue
+
             self.request.parse(data)
+            logging.debug('Request parser state: %d', self.request.state)
 
             if self.request.state >= HttpParser.states.LINE_RCVD:
                 if self.request.method == b'CONNECT':
@@ -658,15 +741,15 @@ class Proxy(threading.Thread):
         except Exception as e:
             logger.exception('Exception while handling connection %r with reason %r' % (self.client.conn, e))
         finally:
-            logger.debug(
-                'closing client connection with pending client buffer size %d bytes, server buffer size %d bytes' %
-                (self.client.buffer_size(), self.server.buffer_size() if self.server else 0))
             if self.client and not self.client.closed:
+                logger.debug(
+                    'closing client connection with pending client buffer size %d bytes, server buffer size %d bytes' %
+                    (self.client.buffer_size(), self.server.buffer_size() if self.server else 0))
                 self.client.close()
             if self.server and not self.server.closed:
                 self.server.close()
             self.access_log()
-            logger.debug('Closing proxy for connection %r at address %r' % (self.client.conn, self.client.addr))
+            logger.debug('Proxy for connection %r at address %r finished' % (self.client.conn, self.client.addr))
 
 
 class TCP(object):
@@ -830,25 +913,20 @@ def set_open_file_limit(soft_limit):
             logger.info('Open file descriptor soft limit set to %d' % soft_limit)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description='proxy.py v%s' % __version__,
-        epilog='Having difficulty using proxy.py? Report at: %s/issues/new' % __homepage__
-    )
-
+def init_flags(parser):
     parser.add_argument('--hostname', type=str, default='127.0.0.1', help='Default: 127.0.0.1')
     parser.add_argument('--port', type=int, default=8899, help='Default: 8899')
     parser.add_argument('--backlog', type=int, default=100,
                         help='Default: 100. '
                              'Maximum number of pending connections '
                              'to proxy server.')
-    parser.add_argument('--num-workers', type=int, default=0, help='Default: Number of CPU cores.')
-    parser.add_argument('--server-connect-timeout', type=int, default=DEFAULT_SERVER_CONNECT_TIMEOUT,
-                        help='Default: 30 seconds. Timeout when connecting to upstream servers.')
     parser.add_argument('--basic-auth', type=str, default=None,
                         help='Default: No authentication. '
                              'Specify colon separated user:password '
                              'to enable basic authentication.')
+    parser.add_argument('--num-workers', type=int, default=0, help='Default: Number of CPU cores.')
+    parser.add_argument('--server-connect-timeout', type=int, default=DEFAULT_SERVER_CONNECT_TIMEOUT,
+                        help='Default: 30 seconds. Timeout when connecting to upstream servers.')
     parser.add_argument('--server-recvbuf-size', type=int, default=DEFAULT_SERVER_RECVBUF_SIZE,
                         help='Default: 1 MB. '
                              'Maximum amount of data received from the '
@@ -867,14 +945,22 @@ def main():
                              'that proxy.py can open concurrently.')
     parser.add_argument('--log-level', type=str, default='INFO',
                         help='DEBUG, INFO (default), WARNING, ERROR, CRITICAL.')
-    parser.add_argument('--version', action='store_true', help='Print proxy.py version.')
-    args = parser.parse_args()
+    parser.add_argument('-v', '--version', action='store_true', help='Print proxy.py version.')
 
-    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format=DEFAULT_LOGGING_FORMAT)
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='proxy.py v%s' % __version__,
+        epilog='Having difficulty using proxy.py? Report at: %s/issues/new' % __homepage__
+    )
+    init_flags(parser)
+    args = parser.parse_args()
 
     if args.version:
         print(text_(version))
         sys.exit(0)
+
+    logging.basicConfig(level=getattr(logging, args.log_level.upper()), format=DEFAULT_LOGGING_FORMAT)
 
     try:
         set_open_file_limit(args.open_file_limit)
