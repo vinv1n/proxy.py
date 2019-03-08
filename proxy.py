@@ -4,9 +4,21 @@
     proxy.py
     ~~~~~~~~
 
-    HTTP Proxy Server in Python.
+    Lightweight HTTP, HTTPS, WebSockets Proxy Server in a single Python file.
 
-    :copyright: (c) 2013-2018 by Abhinav Singh.
+    Following class hierarchy exists:
+    - Bandwidth: Enforce bandwidth restriction for outgoing client packets.
+    - HttpParser: Parse HTTP request and response packets.
+    - ChunkParser: Internally used by HttpParser to parse chunked encoded data.
+    - Connection: Base TCP connection abstraction.
+      - Server: Server connection on top of Connection class.
+      - Client: Client connection on top of Connection class.
+    - TCP: TCP Server implementation.
+      - HTTP: HTTP Server implementation on top of TCP server class.
+    - Worker: Worker processes spawned by HTTP Server class for Client connection handling.
+    - Proxy: Worker threads spawned by each worker process to proxy client connection.
+
+    :copyright: (c) 2013-2019 by Abhinav Singh.
     :license: BSD, see LICENSE for more details.
 """
 import os
@@ -240,11 +252,17 @@ class HttpParser(object):
             more, data = self.process(data)
         self.buffer = data
 
+    def is_connect_request(self):
+        return self.state == HttpParser.states.LINE_RCVD and \
+               self.type == HttpParser.types.REQUEST_PARSER and \
+               self.method == b'CONNECT'
+
     def process(self, data):
         if self.state in (HttpParser.states.HEADERS_COMPLETE,
                           HttpParser.states.RCVING_BODY,
                           HttpParser.states.COMPLETE) and \
-                (self.method == b'POST' or self.type == HttpParser.types.RESPONSE_PARSER):
+                (self.method == b'POST' or
+                 self.type == HttpParser.types.RESPONSE_PARSER):
             if not self.body:
                 self.body = b''
 
@@ -274,13 +292,13 @@ class HttpParser(object):
 
         # When connect request is received without a following host header
         # See `TestHttpParser.test_connect_request_without_host_header_request_parse` for details
-        if self.state == HttpParser.states.LINE_RCVD and \
-                self.type == HttpParser.types.REQUEST_PARSER and \
-                self.method == b'CONNECT' and \
-                data == CRLF:
+        if self.is_connect_request() and data == CRLF:
             self.state = HttpParser.states.COMPLETE
 
-        # When raw request has ended with \r\n\r\n and no more http headers are expected
+        # When request has ended with \r\n\r\n and
+        # no content-length header was received,
+        # and no more http headers are expected.
+        #
         # See `TestHttpParser.test_request_parse_without_content_length` and
         # `TestHttpParser.test_response_parse_without_content_length` for details
         elif self.state == HttpParser.states.HEADERS_COMPLETE and \
@@ -542,7 +560,7 @@ class Proxy(threading.Thread):
 
         return data
 
-    def tunnel(self):
+    def tunnel(self, parse_response=False):
         """Tunnel establish a transparent connection between client and server."""
         while True:
             writable = []
@@ -580,8 +598,9 @@ class Proxy(threading.Thread):
                 if not data:
                     logger.debug('server closed connection, breaking')
                     break
-                self.response.parse(data)
-                logging.debug('Response parser state: %d', self.response.state)
+                if parse_response:
+                    self.response.parse(data)
+                    logging.debug('Response parser state: %d', self.response.state)
                 self.client.queue(data)
 
     def proxy_https_request(self):
@@ -666,7 +685,7 @@ class Proxy(threading.Thread):
             add_headers=add_headers
         ))
 
-        self.tunnel()
+        self.tunnel(parse_response=True)
 
     def handle_server_request(self):
         """Handles incoming requests to proxy web server."""

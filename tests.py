@@ -281,6 +281,19 @@ class TestHttpParser(unittest.TestCase):
         self.assertNotEqual(self.parser.version, b'HTTP/1.1')
         self.assertEqual(self.parser.state, HttpParser.states.COMPLETE)
 
+    def test_http_1_1_pipeline(self):
+        self.parser.parse(CRLF.join([
+            b'GET http://localhost:9999 HTTP/1.1',
+            b'Host: localhost:9999',
+            b'Connection: keep-alive',
+            CRLF,
+            b'GET http://localhost:9999/get HTTP/1.1',
+        ]))
+        self.assertEqual(self.parser.method, b'GET')
+        self.assertEqual(self.parser.version, b'HTTP/1.1')
+        self.assertEqual(self.parser.state, HttpParser.states.COMPLETE)
+        self.assertEqual(self.parser.buffer, b'')
+
     def test_response_parse_without_content_length(self):
         """Case when server response doesn't contain a content-length header for non-chunk response types.
 
