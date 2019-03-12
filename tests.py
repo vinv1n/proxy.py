@@ -292,7 +292,7 @@ class TestHttpParser(unittest.TestCase):
         self.assertEqual(self.parser.method, b'GET')
         self.assertEqual(self.parser.version, b'HTTP/1.1')
         self.assertEqual(self.parser.state, HttpParser.states.COMPLETE)
-        self.assertEqual(self.parser.buffer, b'')
+        self.assertEqual(self.parser.buffer, b'GET http://localhost:9999/get HTTP/1.1')
 
     def test_response_parse_without_content_length(self):
         """Case when server response doesn't contain a content-length header for non-chunk response types.

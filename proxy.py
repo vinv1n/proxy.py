@@ -7,16 +7,30 @@
     Lightweight HTTP, HTTPS, WebSockets Proxy Server in a single Python file.
 
     Following class hierarchy exists:
-    - Bandwidth: Enforce bandwidth restriction for outgoing client packets.
-    - HttpParser: Parse HTTP request and response packets.
-    - ChunkParser: Internally used by HttpParser to parse chunked encoded data.
-    - Connection: Base TCP connection abstraction.
-      - Server: Server connection on top of Connection class.
-      - Client: Client connection on top of Connection class.
-    - TCP: TCP Server implementation.
-      - HTTP: HTTP Server implementation on top of TCP server class.
-    - Worker: Worker processes spawned by HTTP Server class for Client connection handling.
-    - Proxy: Worker threads spawned by each worker process to proxy client connection.
+    - `Bandwidth`: Enforce bandwidth restriction for outgoing client packets.
+    - `HttpParser`: Parse HTTP request and response packets.
+    - `ChunkParser`: Internally used by HttpParser to parse chunked encoded data.
+    - `Connection`: Base TCP connection abstraction.
+      - `Server`: Server connection on top of Connection class.
+      - `Client`: Client connection on top of Connection class.
+    - `TCP`: TCP Server implementation.
+      - `HTTP`: HTTP Server implementation on top of TCP server class.
+    - `Worker`: Worker processes spawned by HTTP Server class for Client connection handling.
+    - `Proxy`: Threads spawned by each worker process to proxy client connection.
+
+    On startup:
+    - `HTTP` server instance is started on configured --port parameter
+    - Server instance starts N `Worker` processes.
+      Number of worker processes N depends upon number of available CPU cores.
+
+    For an incoming client request:
+    - `HTTP` server inspects request header line to differentiate between
+      HTTP requests to proxy.py server VS Proxy requests to proxy.py server
+    - For HTTP requests, proxy.py serves local content e.g. proxy.py admin dashboard, APIs etc
+    - For Proxy requests, `HTTP` server instance queues client request to be processed
+      by one of the worker processes.
+    - `Worker` process receives the queued client request and starts a `Proxy` thread to handle
+      client proxy request.
 
     :copyright: (c) 2013-2019 by Abhinav Singh.
     :license: BSD, see LICENSE for more details.
@@ -249,7 +263,18 @@ class HttpParser(object):
 
         more = True if len(data) > 0 else False
         while more:
-            more, data = self.process(data)
+            if self.state in (HttpParser.states.HEADERS_COMPLETE,
+                              HttpParser.states.RCVING_BODY,
+                              HttpParser.states.COMPLETE):
+                if self.method == b'POST' or self.type == HttpParser.types.RESPONSE_PARSER:
+                    more, data = self.process_body(data)
+                else:
+                    line, data = HttpParser.split(data)
+                    if line is False:
+                        self.state = HttpParser.states.COMPLETE
+                        more = False
+            else:
+                more, data = self.process_headers(data)
         self.buffer = data
 
     def is_connect_request(self):
@@ -257,30 +282,26 @@ class HttpParser(object):
                self.type == HttpParser.types.REQUEST_PARSER and \
                self.method == b'CONNECT'
 
-    def process(self, data):
-        if self.state in (HttpParser.states.HEADERS_COMPLETE,
-                          HttpParser.states.RCVING_BODY,
-                          HttpParser.states.COMPLETE) and \
-                (self.method == b'POST' or
-                 self.type == HttpParser.types.RESPONSE_PARSER):
-            if not self.body:
-                self.body = b''
+    def process_body(self, data):
+        if not self.body:
+            self.body = b''
 
-            if b'content-length' in self.headers:
-                self.state = HttpParser.states.RCVING_BODY
-                self.body += data
-                if len(self.body) >= int(self.headers[b'content-length'][1]):
-                    self.state = HttpParser.states.COMPLETE
-            elif self.is_chunked_encoded_response():
-                if not self.chunk_parser:
-                    self.chunk_parser = ChunkParser()
-                self.chunk_parser.parse(data)
-                if self.chunk_parser.state == ChunkParser.states.COMPLETE:
-                    self.body = self.chunk_parser.body
-                    self.state = HttpParser.states.COMPLETE
+        if b'content-length' in self.headers:
+            self.state = HttpParser.states.RCVING_BODY
+            self.body += data
+            if len(self.body) >= int(self.headers[b'content-length'][1]):
+                self.state = HttpParser.states.COMPLETE
+        elif self.is_chunked_encoded_response():
+            if not self.chunk_parser:
+                self.chunk_parser = ChunkParser()
+            self.chunk_parser.parse(data)
+            if self.chunk_parser.state == ChunkParser.states.COMPLETE:
+                self.body = self.chunk_parser.body
+                self.state = HttpParser.states.COMPLETE
 
-            return False, b''
+        return False, b''
 
+    def process_headers(self, data):
         line, data = HttpParser.split(data)
         if line is False:
             return line, data
@@ -599,6 +620,8 @@ class Proxy(threading.Thread):
                     logger.debug('server closed connection, breaking')
                     break
                 if parse_response:
+                    # TODO: Reset response parser for HTTP/1.1 pipeline use cases.
+                    # Ideally we also want to output multiple access logs for http only use case.
                     self.response.parse(data)
                     logging.debug('Response parser state: %d', self.response.state)
                 self.client.queue(data)
