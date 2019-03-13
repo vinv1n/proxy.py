@@ -729,7 +729,7 @@ class Proxy(threading.Thread):
                 self.client.flush()
         self.client.close()
 
-    def process(self):
+    def get_request_handler(self):
         """Read client request method line.
 
         We need to inspect request line to differentiate between
@@ -737,7 +737,6 @@ class Proxy(threading.Thread):
         the proxy.py web server itself.
         """
         handler = None
-
         while True:
             data = self.read_once()
             if data is None:
@@ -746,23 +745,27 @@ class Proxy(threading.Thread):
             if data is False:
                 continue
 
-            self.request.parse(data)
-            logging.debug('Request parser state: %d', self.request.state)
-
-            if self.request.state >= HttpParser.states.LINE_RCVD:
-                if self.request.method == b'CONNECT':
-                    handler = self.proxy_https_request
-                elif self.request.url:
-                    if self.request.url.netloc != b'':
-                        handler = self.proxy_http_request
-                    else:
-                        handler = self.handle_server_request
-                else:
-                    raise Exception('Invalid request\n%s' % self.request.raw)
+            handler = self._get_request_handler(data)
+            if callable(handler):
                 break
+        return handler
 
-        if handler:
-            handler()
+    def _get_request_handler(self, data):
+        self.request.parse(data)
+        logging.debug('Request parser state: %d', self.request.state)
+
+        if self.request.state >= HttpParser.states.LINE_RCVD:
+            if self.request.method == b'CONNECT':
+                return self.proxy_https_request
+            elif self.request.url:
+                if self.request.url.netloc != b'':
+                    return self.proxy_http_request
+                else:
+                    return self.handle_server_request
+            else:
+                raise Exception('Invalid request\n%s' % self.request.raw)
+
+        return None
 
     def access_log(self):
         host, port = self.server.addr if self.server else (None, None)
@@ -777,7 +780,7 @@ class Proxy(threading.Thread):
     def run(self):
         logger.debug('Proxying connection %r' % self.client.conn)
         try:
-            self.process()
+            self.get_request_handler()()
         except KeyboardInterrupt:
             pass
         except Exception as e:
@@ -817,9 +820,10 @@ class TCP(object):
         self.running = True
         try:
             logger.info('Starting proxy.py on port %d' % self.port)
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.hostname, self.port))
+            sock_address = socket.getaddrinfo("localhost", self.port, socket.AF_INET6, 0, socket.SOL_TCP)
+            self.socket.bind(sock_address[0][4])
             self.socket.listen(self.backlog)
 
             while self.running:

@@ -412,6 +412,9 @@ class MockConnection(object):
     def close(self):
         pass
 
+    def shutdown(self, how):
+        pass
+
 
 def get_available_port():
     """Finds and retuns an available port on the system."""
@@ -444,6 +447,62 @@ def start_http_server(http_handler=HTTPRequestHandler):
     return http_server_port, http_server, http_server_thread
 
 
+def make_request(request_url, proxy_server_port=None):
+    """Makes an HTTP GET request (optionally via proxy server)."""
+    if proxy_server_port:
+        proxy_address = 'http://127.0.0.1:%d' % proxy_server_port
+        logging.info('Using proxy %s' % proxy_address)
+        proxy = urllib.request.ProxyHandler({'http': proxy_address})
+        opener = urllib.request.build_opener(proxy)
+        urllib.request.install_opener(opener)
+    logging.info('Making request to %s' % request_url)
+    return urllib.request.urlopen(request_url, timeout=1)
+
+
+class TestProxyHandler(unittest.TestCase):
+
+    def setUp(self):
+        self._conn = MockConnection()
+        self._addr = ('127.0.0.1', 54382)
+        self.proxy = Proxy(self._conn, self._addr)
+
+    def test_get_http_request_handler(self):
+        handler = self.proxy._get_request_handler(b'GET http://localhost:8080 HTTP/1.1' + CRLF)
+        self.assertEqual(handler, self.proxy.proxy_http_request)
+
+    def test_get_https_request_handler(self):
+        handler = self.proxy._get_request_handler(b'CONNECT https://localhost:443 HTTP/1.1' + CRLF)
+        self.assertEqual(handler, self.proxy.proxy_https_request)
+
+    def test_get_server_request_handler(self):
+        handler = self.proxy._get_request_handler(b'GET / HTTP/1.1' + CRLF)
+        self.assertEqual(handler, self.proxy.handle_server_request)
+
+
+class TestHttpProxyRequest(unittest.TestCase):
+
+    def setUp(self):
+        self._conn = MockConnection()
+        self._addr = ('127.0.0.1', 54382)
+        self.proxy = Proxy(self._conn, self._addr)
+
+
+class TestHttpsProxyRequest(unittest.TestCase):
+
+    def setUp(self):
+        self._conn = MockConnection()
+        self._addr = ('127.0.0.1', 54382)
+        self.proxy = Proxy(self._conn, self._addr)
+
+
+class TestServerRequest(unittest.TestCase):
+
+    def setUp(self):
+        self._conn = MockConnection()
+        self._addr = ('127.0.0.1', 54382)
+        self.proxy = Proxy(self._conn, self._addr)
+
+
 class TestProxy(unittest.TestCase):
 
     http_server = None
@@ -452,7 +511,15 @@ class TestProxy(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
+        # Start a local test HTTP server to which we can actually make a request while
+        # testing proxy.py implementations.
         cls.http_server_port, cls.http_server, cls.http_server_thread = start_http_server()
+        while True:
+            try:
+                _ = make_request('http://127.0.0.1:%d' % cls.http_server_port)
+                break
+            except urllib.error.URLError:
+                pass
 
     @classmethod
     def tearDownClass(cls):
@@ -468,7 +535,6 @@ class TestProxy(unittest.TestCase):
     def test_http_get(self):
         # Send request line
         self.proxy.client.conn.queue((b'GET http://localhost:%d HTTP/1.1' % self.http_server_port) + CRLF)
-        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
         self.assertNotEqual(self.proxy.request.state, HttpParser.states.COMPLETE)
         # Send headers and blank line, thus completing HTTP request
         self.proxy.client.conn.queue(CRLF.join([
@@ -478,7 +544,7 @@ class TestProxy(unittest.TestCase):
             b'Proxy-Connection: Keep-Alive',
             CRLF
         ]))
-        self.proxy.process_request(self.proxy.client.recv(DEFAULT_CLIENT_RECVBUF_SIZE))
+        self.proxy.process()
         self.assertEqual(self.proxy.request.state, HttpParser.states.COMPLETE)
         self.assertEqual(self.proxy.server.addr, (b'localhost', self.http_server_port))
         # Flush data queued for server
@@ -487,7 +553,7 @@ class TestProxy(unittest.TestCase):
         # Receive full response from server
         data = self.proxy.server.recv(DEFAULT_SERVER_RECVBUF_SIZE)
         while data:
-            self.proxy.process_response(data)
+            self.proxy.process()
             logging.info(self.proxy.response.state)
             if self.proxy.response.state == HttpParser.states.COMPLETE:
                 break
@@ -660,7 +726,7 @@ class TestWorkers(unittest.TestCase):
         # Wait until http and proxy server setup is up
         while True:
             try:
-                _ = TestWorkers.make_request('http://127.0.0.1:%d' % cls.http_server_port, cls.proxy_server_port)
+                _ = make_request('http://127.0.0.1:%d' % cls.http_server_port, cls.proxy_server_port)
                 break
             except urllib.error.URLError:
                 pass
@@ -672,16 +738,6 @@ class TestWorkers(unittest.TestCase):
         cls.http_server_thread.join()
         cls.proxy_server.stop()
         cls.proxy_server_thread.join()
-
-    @staticmethod
-    def make_request(request_url, proxy_server_port):
-        proxy_address = 'http://127.0.0.1:%d' % proxy_server_port
-        logging.info('Using proxy %s' % proxy_address)
-        proxy = urllib.request.ProxyHandler({'http': proxy_address})
-        opener = urllib.request.build_opener(proxy)
-        urllib.request.install_opener(opener)
-        logging.info('Making request to %s' % request_url)
-        return urllib.request.urlopen(request_url, timeout=1)
 
     @unittest.skipIf(not PY3, 'Skipped for PY2 due to PY3 only make_request version')
     def test_request_via_proxied(self):
