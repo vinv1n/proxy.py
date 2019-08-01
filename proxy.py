@@ -512,7 +512,7 @@ class Proxy(threading.Thread):
         host, port = self.server.addr if self.server else (None, None)
         if self.request.method == b'CONNECT':
             logger.info(
-                '%s:%s - %s %s:%s' % (self.client.addr[0], self.client.addr[1], self.request.method, host, port))
+                'from %s:%s - method %s host and port %s:%s data %s' % (self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.raw))
         elif self.request.method:
             logger.info('%s:%s - %s %s:%s%s - %s %s - %s bytes' % (
                 self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.build_url(),
@@ -706,7 +706,7 @@ def main():
     parser.add_argument('--log-level', default='INFO', help='DEBUG, INFO (default), WARNING, ERROR, CRITICAL')
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, args.log_level),
+    logging.basicConfig(filename="server.log", filemode="a", level=getattr(logging, args.log_level),
                         format='%(asctime)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s')
 
     try:
