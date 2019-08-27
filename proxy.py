@@ -94,7 +94,7 @@ PROXY_AUTHENTICATION_REQUIRED_RESPONSE_PKT = CRLF.join([
 ]) + b'Proxy Authentication Required'
 
 
-class ChunkParser(object):
+class ChunkParser:
     """HTTP chunked encoding response parser."""
 
     states = namedtuple('ChunkParserStates', (
@@ -144,7 +144,7 @@ class ChunkParser(object):
         return len(data) > 0, data
 
 
-class HttpParser(object):
+class HttpParser:
     """HTTP request/response parser."""
 
     states = namedtuple('HttpParserStates', (
@@ -326,7 +326,7 @@ class HttpParser(object):
         return line, data
 
 
-class Connection(object):
+class Connection:
     """TCP server/client connection abstraction."""
 
     def __init__(self, what):
@@ -512,11 +512,12 @@ class Proxy(threading.Thread):
         host, port = self.server.addr if self.server else (None, None)
         if self.request.method == b'CONNECT':
             logger.info(
-                'from %s:%s - method %s host and port %s:%s data %s' % (self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.raw))
+                    f'from {self.client.addr[0]}:{self.client.addr[1]} - method {self.request.method} host and port {host}:{port} data {self.request.raw} url {self.request.build_url()}'
+                )
         elif self.request.method:
-            logger.info('%s:%s - %s %s:%s%s - %s %s - %s bytes' % (
-                self.client.addr[0], self.client.addr[1], self.request.method, host, port, self.request.build_url(),
-                self.response.code, self.response.reason, len(self.response.raw)))
+            logger.info(f'{self.client.addr[0]}:{self.client.addr[1]} - {self.request.method} {host}:{port}{self.request.build_url()} ' \
+                        f'- {self.response.code} {self.response.reason} - {len(self.response.raw)} bytes'
+            )
 
     def _get_waitable_lists(self):
         rlist, wlist, xlist = [self.client.conn], [], []
@@ -613,7 +614,7 @@ class Proxy(threading.Thread):
             logger.debug('Closing proxy for connection %r at address %r' % (self.client.conn, self.client.addr))
 
 
-class TCP(object):
+class TCP:
     """TCP server implementation.
 
     Subclass MUST implement `handle` method. It accepts an instance of accepted `Client` connection.
